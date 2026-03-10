@@ -1,0 +1,4 @@
+staticfiles/ffmpeg
+staticfiles/ffprobe
+sessions/local_db.json
+sessions/*.session
