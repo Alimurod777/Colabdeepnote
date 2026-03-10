@@ -235,7 +235,9 @@ async def upload_via_user_session(
 
     try:
         try:
-            await uclient.start()
+            await uclient.connect()
+            # self.me ni to'ldirish — save_file.py ichida is_premium tekshiriladi
+            uclient.me = await uclient.get_me()
         except Exception as conn_err:
             await bot.send_message(user_id, f"**Ulanish xatosi:** `{conn_err}`")
             return False
@@ -339,7 +341,7 @@ async def upload_via_user_session(
 
     finally:
         try:
-            await uclient.stop()
+            await uclient.disconnect()
         except Exception:
             pass
         # Funksiya tomonidan yaratilgan thumbnail ni tozalash
