@@ -22,6 +22,18 @@ from TechVJ.strings import strings, HELP_TXT
 import subprocess
 import shutil
 
+_bot_id_cache = None
+
+
+async def _get_bot_id(client):
+    """Bot ID ni bir marta olib keshlaydi."""
+    global _bot_id_cache
+    if _bot_id_cache is None:
+        me = await client.get_me()
+        _bot_id_cache = me.id
+    return _bot_id_cache
+
+
 STATIC_FFMPEG_PATH = os.path.join(os.path.dirname(__file__), "..", "staticfiles", "ffmpeg")
 
 
@@ -165,14 +177,34 @@ async def make_thumbnail(file_path: str):
     return None
 
 
-async def upload_via_user_session(bot, user_id: int, file_path: str, caption: str = "", progress_msg=None):
+async def upload_via_user_session(
+    bot,
+    user_id: int,
+    file_path: str,
+    caption: str = "",
+    progress_msg=None,
+    target_chat=None,
+    msg_type: str = "Document",
+    extra: dict = None,
+):
     """
-    Faylni user session orqali bot va user orasidagi chatga yuboradi.
-    Bot API emas — userbot client ishlatiladi.
+    Faylni user session orqali target_chat ga yuboradi.
+    target_chat = bot.id bo'lsa, user va bot orasidagi chatga yuboriladi.
+    Bot API emas — userbot client (uclient) ishlatiladi.
     FloodWait avtomatik boshqariladi.
     """
     from database.db import database as _db
     from config import API_ID, API_HASH
+
+    if extra is None:
+        extra = {}
+
+    # Absolute path — uclient boshqa CWD dan ishlaganida ham topadi
+    file_path = os.path.abspath(file_path)
+
+    if not os.path.exists(file_path):
+        await bot.send_message(user_id, f"**Upload xatosi:** fayl topilmadi: `{file_path}`")
+        return False
 
     user_data = _db.find_one({"chat_id": user_id})
     if not user_data or not user_data.get("session"):
@@ -180,18 +212,27 @@ async def upload_via_user_session(bot, user_id: int, file_path: str, caption: st
         return False
 
     session_string = user_data["session"]
-    thumb = await make_thumbnail(file_path)
+
+    # Target chat: bot bilan private chat yoki fallback user_id
+    chat_id = target_chat or user_id
+
+    # Thumbnail faqat document/video uchun
+    thumb = None
+    if msg_type in ("Document", "Video", "Audio"):
+        thumb = extra.get("thumb") or await make_thumbnail(file_path)
+
     parts = await split_file(file_path)
 
     uclient = Client(
         f"sessions/user_{user_id}",
         api_id=API_ID,
         api_hash=API_HASH,
-        session_string=session_string
+        session_string=session_string,
     )
 
     success = True
     parts_to_cleanup = [p for p in parts if p != file_path]
+
     try:
         try:
             await uclient.connect()
@@ -207,13 +248,66 @@ async def upload_via_user_session(bot, user_id: int, file_path: str, caption: st
             uploaded = False
             for attempt in range(5):
                 try:
-                    await uclient.send_document(
-                        chat_id=user_id,
-                        document=part_path,
-                        caption=part_caption,
-                        thumb=thumb,
-                        force_document=False
-                    )
+                    if msg_type == "Video":
+                        await uclient.send_video(
+                            chat_id=chat_id,
+                            video=part_path,
+                            caption=part_caption,
+                            duration=extra.get("duration"),
+                            width=extra.get("width"),
+                            height=extra.get("height"),
+                            thumb=thumb,
+                        )
+                    elif msg_type == "Audio":
+                        await uclient.send_audio(
+                            chat_id=chat_id,
+                            audio=part_path,
+                            caption=part_caption,
+                            duration=extra.get("duration"),
+                            performer=extra.get("performer"),
+                            title=extra.get("title"),
+                            thumb=thumb,
+                        )
+                    elif msg_type == "Voice":
+                        await uclient.send_voice(
+                            chat_id=chat_id,
+                            voice=part_path,
+                            caption=part_caption,
+                            duration=extra.get("duration"),
+                        )
+                    elif msg_type == "Photo":
+                        await uclient.send_photo(
+                            chat_id=chat_id,
+                            photo=part_path,
+                            caption=part_caption,
+                        )
+                    elif msg_type == "Animation":
+                        await uclient.send_animation(
+                            chat_id=chat_id,
+                            animation=part_path,
+                            caption=part_caption,
+                        )
+                    elif msg_type == "VideoNote":
+                        await uclient.send_video_note(
+                            chat_id=chat_id,
+                            video_note=part_path,
+                            duration=extra.get("duration"),
+                            length=extra.get("length"),
+                        )
+                    elif msg_type == "Sticker":
+                        await uclient.send_sticker(
+                            chat_id=chat_id,
+                            sticker=part_path,
+                        )
+                    else:
+                        # Default: Document
+                        await uclient.send_document(
+                            chat_id=chat_id,
+                            document=part_path,
+                            caption=part_caption,
+                            thumb=thumb,
+                            force_document=False,
+                        )
                     uploaded = True
                     break
                 except FloodWait as e:
@@ -230,24 +324,26 @@ async def upload_via_user_session(bot, user_id: int, file_path: str, caption: st
                     break
 
             if not uploaded and success:
-                # FloodWait on all 5 attempts
-                await bot.send_message(user_id, f"**Upload: FloodWait — maksimal urinishlar tugadi.**")
+                await bot.send_message(user_id, "**Upload: FloodWait — maksimal urinishlar tugadi.**")
                 success = False
 
             if not success:
                 break
 
+        # Split qilingan temp fayllarni tozalash
         for part_path in parts_to_cleanup:
             try:
                 os.remove(part_path)
             except Exception:
                 pass
+
     finally:
         try:
             await uclient.disconnect()
         except Exception:
             pass
-        if thumb and thumb != file_path and os.path.exists(thumb):
+        # Funksiya tomonidan yaratilgan thumbnail ni tozalash
+        if thumb and thumb != file_path and not extra.get("thumb") and os.path.exists(thumb):
             try:
                 os.remove(thumb)
             except Exception:
@@ -1698,9 +1794,21 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             await client.delete_messages(message.chat.id, [smsg.id])
         await client.send_message(message.chat.id, "Failed to download media", reply_to_message_id=message.id)
         return
-    
+
+    # Absolute path — uclient boshqa working directory dan ishlaganida ham topadi
+    file = os.path.abspath(file)
+
+    if not os.path.exists(file):
+        if smsg:
+            await client.delete_messages(message.chat.id, [smsg.id])
+        await client.send_message(message.chat.id, f"**Download xatosi:** fayl topilmadi: `{file}`", reply_to_message_id=message.id)
+        return
+
     if show_progress and smsg:
         upsta = asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg))
+
+    # Bot ID olish (user session upload uchun)
+    bot_id = await _get_bot_id(client)
 
     # Handle captions with proper markdown formatting
     caption = None
@@ -1734,189 +1842,146 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
 
     if "Document" == msg_type:
-        # Check file extension to determine how to handle the document
+        # video extension bo'lsa Video sifatida yuborish
         if file.endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv', '.webm')):
-            # Handle video files sent as documents
-            try:
-                # Try to get thumbnail if available
-                ph_path = None
-                if msg.document.thumbs:
-                    try:
-                        ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
-                    except:
-                        pass
-                
-                # Get video attributes if available
-                duration = None
-                width = None
-                height = None
-                
+            doc_msg_type = "Video"
+            extra = {}
+            if hasattr(msg, 'document') and msg.document:
                 for attr in msg.document.attributes:
                     if hasattr(attr, 'duration'):
-                        duration = attr.duration
+                        extra["duration"] = attr.duration
                     if hasattr(attr, 'width'):
-                        width = attr.width
+                        extra["width"] = attr.width
                     if hasattr(attr, 'height'):
-                        height = attr.height
-                
-                # Send as video
-                await client.send_video(
-                    chat, file, duration=duration, width=width, height=height,
-                    thumb=ph_path, caption=first_caption, reply_to_message_id=message.id, progress=progress,
-                    progress_args=[message, "up"], reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN
-                )
-                if second_caption:
-                    await client.send_message(chat, second_caption, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
-                
-                if ph_path and os.path.exists(ph_path):
-                    os.remove(ph_path)
-                    
-            except Exception as e:
-                # If sending as video fails, send as document
-                await client.send_document(
-                    chat, file, caption=first_caption, reply_to_message_id=message.id,
-                    progress=progress, progress_args=[message, "up"],
-                    reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN
-                )
-                if second_caption:
-                    await client.send_message(chat, second_caption, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
-        
+                        extra["height"] = attr.height
         elif file.endswith('.ogg'):
-            # Handle ogg files as voice messages
-            try:
-                await client.send_voice(
-                    chat, file, caption=first_caption,
-                    duration=duration, reply_to_message_id=message.id, progress=progress, 
-                    progress_args=[message, "up"], reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN
-                )
-                if second_caption:
-                    await client.send_message(chat, second_caption, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
-            except Exception as e:
-                # If sending as voice fails, send as document
-                await client.send_document(
-                    chat, file, caption=first_caption, reply_to_message_id=message.id,
-                    progress=progress, progress_args=[message, "up"],
-                    reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN
-                )
-                if second_caption:
-                    await client.send_message(chat, second_caption, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
-        
+            doc_msg_type = "Voice"
+            extra = {}
         else:
-            # Send other document types as they are
-            try:
-                await client.send_document(
-                    chat, file, caption=first_caption, reply_to_message_id=message.id,
-                    progress=progress, progress_args=[message, "up"],
-                    reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN
-                )
-                if second_caption:
-                    await client.send_message(chat, second_caption, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
-            except Exception as e:
-                await client.send_message(message.chat.id, f"Error uploading document: {e}", reply_to_message_id=message.id)
+            doc_msg_type = "Document"
+            extra = {}
+
+        await upload_via_user_session(
+            bot=client,
+            user_id=message.from_user.id,
+            file_path=file,
+            caption=first_caption,
+            progress_msg=smsg,
+            target_chat=bot_id,
+            msg_type=doc_msg_type,
+            extra=extra,
+        )
+        if second_caption:
+            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
 
     elif "Video" == msg_type:
-        try:
-            ph_path = await acc.download_media(msg.video.thumbs[0].file_id) if msg.video.thumbs else None
-        except:
-            ph_path = None
-
-        try:
-            # Send video as stream
-            await client.send_video(
-                chat, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height,
-                thumb=ph_path, caption=first_caption, reply_to_message_id=message.id, progress=progress,
-                progress_args=[message, "up"], reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN
-            )
-            if second_caption:
-                await client.send_message(chat, second_caption, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-        if ph_path and os.path.exists(ph_path):
-            os.remove(ph_path)
+        extra = {
+            "duration": msg.video.duration if hasattr(msg.video, 'duration') else None,
+            "width": msg.video.width if hasattr(msg.video, 'width') else None,
+            "height": msg.video.height if hasattr(msg.video, 'height') else None,
+        }
+        await upload_via_user_session(
+            bot=client,
+            user_id=message.from_user.id,
+            file_path=file,
+            caption=first_caption,
+            progress_msg=smsg,
+            target_chat=bot_id,
+            msg_type="Video",
+            extra=extra,
+        )
+        if second_caption:
+            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
 
     elif "VideoNote" == msg_type:
-        try:
-            await client.send_video_note(
-                chat, file, length=msg.video_note.length, duration=msg.video_note.duration,
-                reply_to_message_id=message.id, progress=progress, progress_args=[message, "up"],
-                reply_markup=reply_markup
-            )
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+        extra = {
+            "duration": msg.video_note.duration if hasattr(msg.video_note, 'duration') else None,
+            "length": msg.video_note.length if hasattr(msg.video_note, 'length') else None,
+        }
+        await upload_via_user_session(
+            bot=client,
+            user_id=message.from_user.id,
+            file_path=file,
+            caption=first_caption,
+            progress_msg=smsg,
+            target_chat=bot_id,
+            msg_type="VideoNote",
+            extra=extra,
+        )
 
     elif "Voice" == msg_type:
-        try:
-            # Get duration if available
-            duration = msg.voice.duration if hasattr(msg.voice, 'duration') else None
-            
-            # Send voice message with improved attributes
-            await client.send_voice(
-                chat, file, caption=first_caption,
-                duration=duration, reply_to_message_id=message.id, progress=progress, 
-                progress_args=[message, "up"], reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN
-            )
-            if second_caption:
-                await client.send_message(chat, second_caption, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+        extra = {
+            "duration": msg.voice.duration if hasattr(msg.voice, 'duration') else None,
+        }
+        await upload_via_user_session(
+            bot=client,
+            user_id=message.from_user.id,
+            file_path=file,
+            caption=first_caption,
+            progress_msg=smsg,
+            target_chat=bot_id,
+            msg_type="Voice",
+            extra=extra,
+        )
+        if second_caption:
+            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
 
     elif "Audio" == msg_type:
-        # Handle regular audio files with all available metadata
-        try:
-            ph_path = await acc.download_media(msg.audio.thumbs[0].file_id) if hasattr(msg.audio, 'thumbs') and msg.audio.thumbs else None
-        except:
-            ph_path = None
-
-        try:
-            # Extract all possible audio metadata
-            duration = msg.audio.duration if hasattr(msg.audio, 'duration') else None
-            performer = msg.audio.performer if hasattr(msg.audio, 'performer') else None
-            title = msg.audio.title if hasattr(msg.audio, 'title') else None
-            
-            await client.send_audio(
-                chat, file, thumb=ph_path, caption=first_caption,
-                duration=duration, performer=performer, title=title,
-                reply_to_message_id=message.id, progress=progress, 
-                progress_args=[message, "up"], reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN
-            )
-            if second_caption:
-                await client.send_message(chat, second_caption, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-        if ph_path and os.path.exists(ph_path):
-            os.remove(ph_path)
+        extra = {
+            "duration": msg.audio.duration if hasattr(msg.audio, 'duration') else None,
+            "performer": msg.audio.performer if hasattr(msg.audio, 'performer') else None,
+            "title": msg.audio.title if hasattr(msg.audio, 'title') else None,
+        }
+        await upload_via_user_session(
+            bot=client,
+            user_id=message.from_user.id,
+            file_path=file,
+            caption=first_caption,
+            progress_msg=smsg,
+            target_chat=bot_id,
+            msg_type="Audio",
+            extra=extra,
+        )
+        if second_caption:
+            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
 
     elif "Photo" == msg_type:
-        try:
-            await client.send_photo(
-                chat, file, caption=first_caption, 
-                reply_to_message_id=message.id, 
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN
-            )
-            if second_caption:
-                await client.send_message(chat, second_caption, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-    
+        await upload_via_user_session(
+            bot=client,
+            user_id=message.from_user.id,
+            file_path=file,
+            caption=first_caption,
+            progress_msg=smsg,
+            target_chat=bot_id,
+            msg_type="Photo",
+        )
+        if second_caption:
+            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
+
     elif "Animation" == msg_type:
-        try:
-            await client.send_animation(
-                chat, file, caption=first_caption, reply_to_message_id=message.id,
-                progress=progress, progress_args=[message, "up"],
-                reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN
-            )
-            if second_caption:
-                await client.send_message(chat, second_caption, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-    
+        await upload_via_user_session(
+            bot=client,
+            user_id=message.from_user.id,
+            file_path=file,
+            caption=first_caption,
+            progress_msg=smsg,
+            target_chat=bot_id,
+            msg_type="Animation",
+        )
+        if second_caption:
+            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
+
     elif "Sticker" == msg_type:
-        try:
-            await client.send_sticker(chat, file, reply_to_message_id=message.id)
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-    
+        await upload_via_user_session(
+            bot=client,
+            user_id=message.from_user.id,
+            file_path=file,
+            caption=first_caption,
+            progress_msg=smsg,
+            target_chat=bot_id,
+            msg_type="Sticker",
+        )
+
     elif msg.media == MessageMediaType.VENUE:
         return "Venue"
     elif msg.media == 'web_page':
@@ -1929,19 +1994,19 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             return "Text"  # Fallback to text if any error occurs with web_page
     elif msg.media == MessageMediaType.DICE:
         return "Dice"
-    
+
     else:
-        # Unknown type - send as document
-        try:
-            await client.send_document(
-                chat, file, caption=first_caption, reply_to_message_id=message.id,
-                progress=progress, progress_args=[message, "up"],
-                reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN
-            )
-            if second_caption:
-                await client.send_message(chat, second_caption, reply_to_message_id=message.id, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            await client.send_message(message.chat.id, f"Error uploading unknown file type: {e}", reply_to_message_id=message.id)
+        await upload_via_user_session(
+            bot=client,
+            user_id=message.from_user.id,
+            file_path=file,
+            caption=first_caption,
+            progress_msg=smsg,
+            target_chat=bot_id,
+            msg_type="Document",
+        )
+        if second_caption:
+            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
 
     if os.path.exists(f'{message.id}upstatus.txt'):
         os.remove(f'{message.id}upstatus.txt')
