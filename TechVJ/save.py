@@ -246,7 +246,8 @@ async def upload_via_user_session(
         session_string=session_string,
         in_memory=True,
         no_updates=True,
-        workers=4 if is_premium_hint else 2,
+        sleep_threshold=60,              # FloodWait < 60s → auto-kutadi
+        workers=16 if is_premium_hint else 8,  # parallel upload chunk'lar
     )
 
     success = True
@@ -796,24 +797,17 @@ async def create_client_session(session_string, client_name="saverestricted"):
     for attempt in range(MAX_RETRIES):
         try:
             client = Client(
-                client_name, 
-                session_string=session_string, 
-                api_hash=API_HASH, 
+                client_name,
+                session_string=session_string,
+                api_hash=API_HASH,
                 api_id=API_ID,
-                no_updates=True,  # Disable updates for session clients to reduce overhead
-                in_memory=True,   # Keep session in memory only for better performance
-                sleep_threshold=5, # Lower sleep threshold for better responsiveness
-                device_model="Telegram Desktop", # Set a stable device model
+                no_updates=True,   # updates kerak emas — overhead kamaytiradi
+                in_memory=True,    # disk sessiya yo'q
+                sleep_threshold=60,  # FloodWait < 60s → kutadi, ≥ 60s → raise
+                workers=16,          # parallel download chunk'lar — tezlik oshadi
+                device_model="Telegram Desktop",
                 system_version="Windows 10"
             )
-            
-            # Set a shorter timeout for connections if possible
-            try:
-                if hasattr(client, "session") and hasattr(client.session, "set_timeout"):
-                    client.session.set_timeout(15)  # 15 second timeout
-            except:
-                pass
-                
             await client.connect()
             return client, None
         except Exception as e:
@@ -1300,148 +1294,170 @@ async def save(client: Client, message: Message):
 # Process posts with given range
 async def process_posts(client: Client, message: Message, url: str, fromID: int, toID: int):
     # Status message for long operations
+    total = toID - fromID + 1
     status_msg = None
-    if toID - fromID > 5:  # If downloading more than 5 messages, show status
-        status_msg = await client.send_message(message.chat.id, f"Processing {toID - fromID + 1} messages...", reply_to_message_id=message.id)
-    
+    if total > 1:
+        status_msg = await client.send_message(
+            message.chat.id,
+            f"⏳ {total} ta xabar qayta ishlanmoqda...",
+            reply_to_message_id=message.id
+        )
+
     processed = 0
-    for msgid in range(fromID, toID+1):
-        # private
-        if "https://t.me/c/" in url:
-            user_data = database.find_one({'chat_id': message.chat.id})
-            if not get(user_data, 'logged_in', False) or user_data['session'] is None:
-                if status_msg:
-                    await client.edit_message_text(message.chat.id, status_msg.id, strings['need_login'])
-                else:
-                    await client.send_message(message.chat.id, strings['need_login'], reply_to_message_id=message.id)
-                return
-            
-            acc, error = await create_client_session(user_data['session'])
-            if error:
-                if status_msg:
-                    await client.edit_message_text(message.chat.id, status_msg.id, f"Connection error: {error}")
-                else:
-                    await client.send_message(message.chat.id, f"Connection error: {error}", reply_to_message_id=message.id)
-                return
-            
-            # Fix for extracting chat ID to handle format issues
-            try:
-                # Extract only digits from datas[4]
-                chat_id_str = ''.join(filter(str.isdigit, url.split('/')[4]))
-                chatid = int("-100" + chat_id_str)
-            except Exception as e:
-                if status_msg:
-                    await client.edit_message_text(message.chat.id, status_msg.id, f"Error processing URL: {e}")
-                else:
-                    await client.send_message(message.chat.id, f"Error processing URL: {e}", reply_to_message_id=message.id)
-                await safe_disconnect(acc)
-                return
-            
-            try:
-                await handle_private(client, acc, message, chatid, msgid)
-                processed += 1
-                
-                # Update status message every 5 messages
-                if status_msg and processed % 5 == 0:
-                    await client.edit_message_text(message.chat.id, status_msg.id, f"Processed {processed}/{toID - fromID + 1} messages...")
-            except Exception as e:
-                # Don't send any error message for text-only messages
-                pass
-            
+
+    # ── Private kanal: https://t.me/c/CHATID/MSGID ──
+    if "https://t.me/c/" in url:
+        user_data = database.find_one({'chat_id': message.chat.id})
+        if not get(user_data, 'logged_in', False) or not user_data.get('session'):
+            txt = strings['need_login']
+            if status_msg:
+                await client.edit_message_text(message.chat.id, status_msg.id, txt)
+            else:
+                await client.send_message(message.chat.id, txt, reply_to_message_id=message.id)
+            return
+
+        # chat_id URL dan bir marta olinadi
+        try:
+            chat_id_str = ''.join(filter(str.isdigit, url.split('/')[4]))
+            chatid = int("-100" + chat_id_str)
+        except Exception as e:
+            await client.send_message(message.chat.id, f"URL xatosi: {e}", reply_to_message_id=message.id)
+            return
+
+        # acc bir marta yaratiladi — loop davomida qayta ishlatiladi
+        acc, error = await create_client_session(user_data['session'])
+        if error:
+            txt = f"Ulanish xatosi: {error}"
+            if status_msg:
+                await client.edit_message_text(message.chat.id, status_msg.id, txt)
+            else:
+                await client.send_message(message.chat.id, txt, reply_to_message_id=message.id)
+            return
+
+        try:
+            for msgid in range(fromID, toID + 1):
+                try:
+                    await handle_private(client, acc, message, chatid, msgid)
+                    processed += 1
+                except Exception:
+                    pass
+                if status_msg and processed % 5 == 0 and processed > 0:
+                    await client.edit_message_text(
+                        message.chat.id, status_msg.id,
+                        f"⏳ {processed}/{total} xabar..."
+                    )
+                await asyncio.sleep(2)
+        finally:
             await safe_disconnect(acc)
 
-        # bot
-        elif "https://t.me/b/" in url:
-            user_data = database.find_one({"chat_id": message.chat.id})
-            if not get(user_data, 'logged_in', False) or user_data['session'] is None:
-                if status_msg:
-                    await client.edit_message_text(message.chat.id, status_msg.id, strings['need_login'])
-                else:
-                    await client.send_message(message.chat.id, strings['need_login'], reply_to_message_id=message.id)
-                return
-            
-            acc, error = await create_client_session(user_data['session'])
-            if error:
-                if status_msg:
-                    await client.edit_message_text(message.chat.id, status_msg.id, f"Connection error: {error}")
-                else:
-                    await client.send_message(message.chat.id, f"Connection error: {error}", reply_to_message_id=message.id)
-                return
-            
-            username = url.split("/")[4]
-            try:
-                await handle_private(client, acc, message, username, msgid)
-                processed += 1
-                
-                # Update status message every 5 messages
-                if status_msg and processed % 5 == 0:
-                    await client.edit_message_text(message.chat.id, status_msg.id, f"Processed {processed}/{toID - fromID + 1} messages...")
-            except Exception as e:
-                # Don't send any error message for text-only messages
-                pass
-            
-            await safe_disconnect(acc)
-        
-        # public
-        else:
-            username = url.split("/")[3]
+    # ── Bot chat: https://t.me/b/BOTUSERNAME/MSGID ──
+    elif "https://t.me/b/" in url:
+        user_data = database.find_one({"chat_id": message.chat.id})
+        if not get(user_data, 'logged_in', False) or not user_data.get('session'):
+            txt = strings['need_login']
+            if status_msg:
+                await client.edit_message_text(message.chat.id, status_msg.id, txt)
+            else:
+                await client.send_message(message.chat.id, txt, reply_to_message_id=message.id)
+            return
 
-            try:
-                msg = await client.get_messages(username, msgid)
-            except UsernameNotOccupied: 
-                if status_msg:
-                    await client.edit_message_text(message.chat.id, status_msg.id, "The username is not occupied by anyone")
-                else:
-                    await client.send_message(message.chat.id, "The username is not occupied by anyone", reply_to_message_id=message.id)
-                return
-            
-            try:
-                await client.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
-                processed += 1
-                
-                # Update status message every 5 messages
-                if status_msg and processed % 5 == 0:
-                    await client.edit_message_text(message.chat.id, status_msg.id, f"Processed {processed}/{toID - fromID + 1} messages...")
-            except:
-                try:    
-                    user_data = database.find_one({"chat_id": message.chat.id})
-                    if not get(user_data, 'logged_in', False) or user_data['session'] is None:
-                        if status_msg:
-                            await client.edit_message_text(message.chat.id, status_msg.id, strings['need_login'])
-                        else:
-                            await client.send_message(message.chat.id, strings['need_login'], reply_to_message_id=message.id)
-                        return
-                    
-                    acc, error = await create_client_session(user_data['session'])
-                    if error:
-                        if status_msg:
-                            await client.edit_message_text(message.chat.id, status_msg.id, f"Connection error: {error}")
-                        else:
-                            await client.send_message(message.chat.id, f"Connection error: {error}", reply_to_message_id=message.id)
-                        return
-                    
+        username = url.split("/")[4]
+        acc, error = await create_client_session(user_data['session'])
+        if error:
+            txt = f"Ulanish xatosi: {error}"
+            if status_msg:
+                await client.edit_message_text(message.chat.id, status_msg.id, txt)
+            else:
+                await client.send_message(message.chat.id, txt, reply_to_message_id=message.id)
+            return
+
+        try:
+            for msgid in range(fromID, toID + 1):
+                try:
                     await handle_private(client, acc, message, username, msgid)
                     processed += 1
-                    
-                    # Update status message every 5 messages
-                    if status_msg and processed % 5 == 0:
-                        await client.edit_message_text(message.chat.id, status_msg.id, f"Processed {processed}/{toID - fromID + 1} messages...")
-                    
-                    await safe_disconnect(acc)
-                    
-                except Exception as e:
-                    # Don't send any error message for text-only messages
+                except Exception:
                     pass
+                if status_msg and processed % 5 == 0 and processed > 0:
+                    await client.edit_message_text(
+                        message.chat.id, status_msg.id,
+                        f"⏳ {processed}/{total} xabar..."
+                    )
+                await asyncio.sleep(2)
+        finally:
+            await safe_disconnect(acc)
 
-        # wait time with backoff for rate limiting
-        wait_time = 3
-        if processed % 10 == 0 and processed > 0:
-            wait_time = 5  # Longer delay every 10 messages to avoid rate limits
-        await asyncio.sleep(wait_time)
-    
-    # Final status update
+    # ── Ochiq kanal: https://t.me/USERNAME/MSGID ──
+    else:
+        username = url.split("/")[3]
+        # Ochiq kanallar uchun acc faqat copy_message ishlamasa kerak bo'ladi
+        acc = None
+        user_data = None
+
+        try:
+            for msgid in range(fromID, toID + 1):
+                try:
+                    msg = await client.get_messages(username, msgid)
+                except UsernameNotOccupied:
+                    txt = "Username mavjud emas"
+                    if status_msg:
+                        await client.edit_message_text(message.chat.id, status_msg.id, txt)
+                    else:
+                        await client.send_message(message.chat.id, txt, reply_to_message_id=message.id)
+                    return
+                except Exception:
+                    await asyncio.sleep(2)
+                    continue
+
+                try:
+                    # copy_message — bot orqali to'g'ridan-to'g'ri ko'chirish
+                    await client.copy_message(
+                        message.chat.id, msg.chat.id, msg.id,
+                        reply_to_message_id=message.id
+                    )
+                    processed += 1
+                except Exception:
+                    # copy_message ishlamasa user session bilan yuborish
+                    if user_data is None:
+                        user_data = database.find_one({"chat_id": message.chat.id})
+                    if not get(user_data, 'logged_in', False) or not user_data.get('session'):
+                        txt = strings['need_login']
+                        if status_msg:
+                            await client.edit_message_text(message.chat.id, status_msg.id, txt)
+                        else:
+                            await client.send_message(message.chat.id, txt, reply_to_message_id=message.id)
+                        return
+                    if acc is None:
+                        acc, error = await create_client_session(user_data['session'])
+                        if error:
+                            txt = f"Ulanish xatosi: {error}"
+                            if status_msg:
+                                await client.edit_message_text(message.chat.id, status_msg.id, txt)
+                            else:
+                                await client.send_message(message.chat.id, txt, reply_to_message_id=message.id)
+                            return
+                    try:
+                        await handle_private(client, acc, message, username, msgid)
+                        processed += 1
+                    except Exception:
+                        pass
+
+                if status_msg and processed % 5 == 0 and processed > 0:
+                    await client.edit_message_text(
+                        message.chat.id, status_msg.id,
+                        f"⏳ {processed}/{total} xabar..."
+                    )
+                await asyncio.sleep(2)
+        finally:
+            if acc:
+                await safe_disconnect(acc)
+
+    # Yakuniy status
     if status_msg:
-        await client.edit_message_text(message.chat.id, status_msg.id, f"Completed! Processed {processed} messages.")
+        await client.edit_message_text(
+            message.chat.id, status_msg.id,
+            f"✅ Tayyor! {processed}/{total} xabar yuborildi."
+        )
 
 # Handle comment threads
 async def handle_comment_thread(client: Client, message: Message, url):
@@ -1666,36 +1682,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             msg: Message = await acc.get_messages(chatid, msgid)
             if not msg:
                 return  # Silently ignore if message not found
-                
-            # Check if user is a member of the chat/channel
-            if isinstance(chatid, int):  # For channels/groups (not for usernames)
-                try:
-                    # Try to get chat to check if the user can access it
-                    chat_info = await acc.get_chat(chatid)
-                    
-                    # Try to get the user's member status 
-                    try:
-                        member = await acc.get_chat_member(chatid, "me")
-                        is_member = member.status not in ["LEFT", "BANNED"]
-                    except Exception:
-                        # If we can't get member status but can get chat info,
-                        # user might have limited access
-                        is_member = False
-                    
-                    # If user is not a member, suggest joining
-                    if not is_member:
-                        join_text = f"⚠️ You are not a member of {chat_info.title}. "
-                        join_text += "Some content may be restricted. Please join the channel for full access."
-                        await client.send_message(
-                            message.chat.id,
-                            join_text,
-                            reply_to_message_id=message.id,
-                            parse_mode=None  # Explicitly disable any additional parsing
-                        )
-                except Exception:
-                    # If we can't even get chat info, silently continue
-                    pass
-                
+
             msg_type = get_message_type(msg)
             
             # Handle polls specially
