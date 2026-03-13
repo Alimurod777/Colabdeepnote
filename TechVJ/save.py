@@ -267,16 +267,23 @@ async def upload_via_user_session(
                 pass
             # ── Premium check → split qaror ──
             is_premium = getattr(uclient.me, 'is_premium', False)
-            file_size = os.path.getsize(file_path)
+            # BytesIO uchun getsize ishlamaydi — tashqaridan kelgan file_size ishlatiladi
+            if isinstance(file_path, str):
+                upload_file_size = os.path.getsize(file_path)
+            else:
+                upload_file_size = file_size  # BytesIO: tashqaridan uzatilgan qiymat
 
-            if is_premium and file_size < FOUR_GB:
+            if isinstance(file_path, io.BytesIO):
+                # BytesIO split qilinmaydi — har doim <300MB bo'ladi
                 parts = [file_path]
-            elif is_premium and file_size >= FOUR_GB:
+            elif is_premium and upload_file_size < FOUR_GB:
+                parts = [file_path]
+            elif is_premium and upload_file_size >= FOUR_GB:
                 parts = await split_file(file_path, TWO_GB)
             else:
                 parts = await split_file(file_path, TWO_GB)
 
-            parts_to_cleanup = [p for p in parts if p != file_path]
+            parts_to_cleanup = [p for p in parts if isinstance(p, str) and p != file_path]
         except Exception as conn_err:
             await bot.send_message(user_id, f"**Ulanish xatosi:** `{conn_err}`")
             return False
@@ -392,7 +399,7 @@ async def upload_via_user_session(
                     except Exception:
                         pass
                 parts = await split_file(file_path, TWO_GB)
-                parts_to_cleanup = [p for p in parts if p != file_path]
+                parts_to_cleanup = [p for p in parts if isinstance(p, str) and p != file_path]
                 ok, err = await _upload_parts(parts)
                 if not ok:
                     if err is not None:
