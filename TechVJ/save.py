@@ -240,10 +240,12 @@ async def upload_via_user_session(
 
     is_premium_hint = bool(user_data.get("is_premium", False))
     uclient = Client(
-        f"sessions/user_{user_id}",
+        f"user_{user_id}",
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=session_string,
+        in_memory=True,
+        no_updates=True,
         workers=4 if is_premium_hint else 2,
     )
 
@@ -257,12 +259,11 @@ async def upload_via_user_session(
             # Bot peer'ini uclient cache ga yuklash — PEER_ID_INVALID oldini olish.
             # uclient yangi session bo'lgani uchun bot peer'ini bilmaydi.
             # get_chat(username) → ResolveUsername RPC → access_hash olinadi.
-            # get_users(numeric_id) ishlamaydi chunki access_hash yo'q.
             try:
                 if _bot_username_cache:
                     await uclient.get_chat(_bot_username_cache)
                 else:
-                    await uclient.get_users(chat_id)
+                    await uclient.get_chat(chat_id)
             except Exception:
                 pass
             # ── Premium check → split qaror ──
@@ -291,6 +292,12 @@ async def upload_via_user_session(
         # ── Helper: bitta partni yuborish (DRY) ──
         async def _do_send_part(part_path, part_caption, part_idx, total_parts):
             """Bitta part ni uclient orqali yuboradi. True/False qaytaradi."""
+
+            # Upload progress uchun callback — RAMga yozadi
+            def _up_progress(current, total):
+                if progress_msg:
+                    write_progress(f"{progress_msg.id}_up", current, total)
+
             for attempt in range(5):
                 try:
                     if msg_type == "Video":
@@ -300,6 +307,7 @@ async def upload_via_user_session(
                             duration=extra.get("duration"),
                             width=extra.get("width"),
                             height=extra.get("height"), thumb=thumb,
+                            progress=_up_progress,
                         )
                     elif msg_type == "Audio":
                         await uclient.send_audio(
@@ -308,38 +316,45 @@ async def upload_via_user_session(
                             duration=extra.get("duration"),
                             performer=extra.get("performer"),
                             title=extra.get("title"), thumb=thumb,
+                            progress=_up_progress,
                         )
                     elif msg_type == "Voice":
                         await uclient.send_voice(
                             chat_id=chat_id, voice=part_path,
                             caption=part_caption,
                             duration=extra.get("duration"),
+                            progress=_up_progress,
                         )
                     elif msg_type == "Photo":
                         await uclient.send_photo(
                             chat_id=chat_id, photo=part_path,
                             caption=part_caption,
+                            progress=_up_progress,
                         )
                     elif msg_type == "Animation":
                         await uclient.send_animation(
                             chat_id=chat_id, animation=part_path,
                             caption=part_caption,
+                            progress=_up_progress,
                         )
                     elif msg_type == "VideoNote":
                         await uclient.send_video_note(
                             chat_id=chat_id, video_note=part_path,
                             duration=extra.get("duration"),
                             length=extra.get("length"),
+                            progress=_up_progress,
                         )
                     elif msg_type == "Sticker":
                         await uclient.send_sticker(
                             chat_id=chat_id, sticker=part_path,
+                            progress=_up_progress,
                         )
                     else:
                         await uclient.send_document(
                             chat_id=chat_id, document=part_path,
                             caption=part_caption, thumb=thumb,
                             force_document=False,
+                            progress=_up_progress,
                         )
                     return True
                 except FloodWait as e:
@@ -352,12 +367,15 @@ async def upload_via_user_session(
                                 )
                             else:
                                 await progress_msg.edit(
-                                    f"**FloodWait:** {wait} soniya kutilmoqda..."
+                                    f"⏳ **FloodWait:** {wait} soniya kutilmoqda..."
                                 )
                         except Exception:
                             pass
                     await asyncio.sleep(wait)
-                except Exception:
+                except Exception as send_err:
+                    print(f"[UPLOAD] xato attempt={attempt}: {type(send_err).__name__}: {send_err}")
+                    import traceback
+                    traceback.print_exc()
                     raise
             return False
 
@@ -849,18 +867,22 @@ async def downstatus(
     message: Message,
     stop_event: asyncio.Event,
 ) -> None:
-    """Download progressini RAMdan o'qib xabarni yangilaydi."""
+    """Download progressini RAMdan o'qib xabarni yangilaydi (har 3 soniyada)."""
     key = f"{msg_id}_down"
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
+    last_txt = ""
     while not stop_event.is_set():
         txt = read_progress(key)
-        try:
-            await client.edit_message_text(
-                message.chat.id, message.id, f"Downloaded: {txt}"
-            )
-        except Exception:
-            pass
-        await asyncio.sleep(10)
+        if txt != last_txt:
+            try:
+                await client.edit_message_text(
+                    message.chat.id, message.id,
+                    f"📥 **Yuklab olinmoqda...**\n`{txt}`"
+                )
+                last_txt = txt
+            except Exception:
+                pass
+        await asyncio.sleep(3)
     clear_progress(key)
 
 
@@ -871,18 +893,22 @@ async def upstatus(
     message: Message,
     stop_event: asyncio.Event,
 ) -> None:
-    """Upload progressini RAMdan o'qib xabarni yangilaydi."""
+    """Upload progressini RAMdan o'qib xabarni yangilaydi (har 3 soniyada)."""
     key = f"{msg_id}_up"
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
+    last_txt = ""
     while not stop_event.is_set():
         txt = read_progress(key)
-        try:
-            await client.edit_message_text(
-                message.chat.id, message.id, f"Uploaded: {txt}"
-            )
-        except Exception:
-            pass
-        await asyncio.sleep(10)
+        if txt != last_txt:
+            try:
+                await client.edit_message_text(
+                    message.chat.id, message.id,
+                    f"📤 **Yuklanmoqda...**\n`{txt}`"
+                )
+                last_txt = txt
+            except Exception:
+                pass
+        await asyncio.sleep(3)
     clear_progress(key)
 
 
@@ -1863,17 +1889,12 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         down_event = asyncio.Event()
         dosta = asyncio.create_task(downstatus(client, message.id, smsg, down_event))
 
-    # RAM buffer qaror
-    use_ram = (file_size > 0) and await buffer_mgr.should_buffer(file_size)
-
-    # Download with retry logic
+    # Download — har doim diskka (progress RAMda saqlanadi)
+    use_ram = False
     file = None
     for dl_attempt in range(MAX_RETRIES):
         try:
-            if use_ram:
-                # RAMda bufer — disk yozilmaydi
-                file = await acc.download_media(msg, in_memory=True)
-            elif show_progress:
+            if show_progress:
                 file = await acc.download_media(msg, progress=progress, progress_args=[message, "down"])
             else:
                 file = await acc.download_media(msg)
@@ -1883,11 +1904,6 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 down_event.set()
             break  # Muvaffaqiyat
         except Exception as e:
-            # RAM band qilingan bo'lsa — bo'shat
-            if use_ram:
-                await buffer_mgr.release(file_size)
-                use_ram = False  # Fallback: disk
-
             error_str = str(e).lower()
             if "downloadable media" in error_str:
                 if smsg:
@@ -1935,7 +1951,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
     if show_progress and smsg:
         up_event = asyncio.Event()
-        upsta = asyncio.create_task(upstatus(client, message.id, smsg, up_event))
+        upsta = asyncio.create_task(upstatus(client, smsg.id, smsg, up_event))
 
     # Bot ID olish (user session upload uchun)
     bot_id = await _get_bot_id(client)
@@ -2156,8 +2172,6 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         if second_caption:
             await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
 
-    if os.path.exists(f'{message.id}upstatus.txt'):
-        os.remove(f'{message.id}upstatus.txt')
     if isinstance(file, str) and os.path.exists(file):
         os.remove(file)
     # upstatus loopini to'xtatish

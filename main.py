@@ -17,6 +17,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Pyrogram ichki ulanish/uzilish loglarini sokinlashtirish
+# (har upload uchun uclient connect/disconnect bo'ladi — bu normal, INFO shovqin qiladi)
+logging.getLogger("pyrogram.session.session").setLevel(logging.WARNING)
+logging.getLogger("pyrogram.connection.connection").setLevel(logging.WARNING)
+logging.getLogger("pyrogram.session.auth").setLevel(logging.WARNING)
+
 # Setup uvloop for improved performance if not on Windows
 def setup_event_loop():
     if platform.system() != "Windows":
