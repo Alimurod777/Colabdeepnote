@@ -246,8 +246,7 @@ async def upload_via_user_session(
         session_string=session_string,
         in_memory=True,
         no_updates=True,
-        sleep_threshold=60,              # FloodWait < 60s → auto-kutadi
-        workers=16 if is_premium_hint else 8,  # parallel upload chunk'lar
+        sleep_threshold=60,
     )
 
     success = True
@@ -801,10 +800,9 @@ async def create_client_session(session_string, client_name="saverestricted"):
                 session_string=session_string,
                 api_hash=API_HASH,
                 api_id=API_ID,
-                no_updates=True,   # updates kerak emas — overhead kamaytiradi
-                in_memory=True,    # disk sessiya yo'q
-                sleep_threshold=60,  # FloodWait < 60s → kutadi, ≥ 60s → raise
-                workers=16,          # parallel download chunk'lar — tezlik oshadi
+                no_updates=True,
+                in_memory=True,
+                sleep_threshold=60,
                 device_model="Telegram Desktop",
                 system_version="Windows 10"
             )
@@ -907,9 +905,14 @@ async def upstatus(
 
 
 # progress writer — RAMga yozadi (disk fayl yo'q)
-def progress(current, total, message, ptype):
-    """Progress foizini RAMga yozadi (disk fayl yo'q)."""
-    write_progress(f"{message.id}_{ptype}", current, total)
+def progress(current, total, key_or_msg, ptype):
+    """Progress foizini RAMga yozadi (disk fayl yo'q).
+    key_or_msg — int (msgid) yoki Message ob'ekti bo'lishi mumkin."""
+    if isinstance(key_or_msg, int):
+        key = f"{key_or_msg}_{ptype}"
+    else:
+        key = f"{key_or_msg.id}_{ptype}"
+    write_progress(key, current, total)
 
 
 # start command
@@ -1339,8 +1342,8 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
                 try:
                     await handle_private(client, acc, message, chatid, msgid)
                     processed += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[process_posts] msgid={msgid} xatosi: {type(e).__name__}: {e}")
                 if status_msg and processed % 5 == 0 and processed > 0:
                     await client.edit_message_text(
                         message.chat.id, status_msg.id,
@@ -1650,17 +1653,19 @@ async def handle_topic(client: Client, message: Message, url):
                         try:
                             await handle_private(client, acc, message, chat_id, msg_id)
                             processed_count += 1
-                        except Exception:
-                            # Silently ignore all errors
-                            pass
-                except Exception:
-                    # Silently ignore all errors for individual messages
+                        except Exception as hp_err:
+                            # Xatoni loglash (jimgina o'tkazib yuborish o'rniga)
+                            print(f"[handle_topic] msg_id={msg_id} xatosi: {type(hp_err).__name__}: {hp_err}")
+                except Exception as inner_err:
+                    # Individual message xatosi
+                    print(f"[handle_topic] inner msg_id={msg_id}: {type(inner_err).__name__}: {inner_err}")
                     pass
-                
+
                 await asyncio.sleep(1)  # Shorter delay between messages
-                
-            except Exception:
+
+            except Exception as outer_err:
                 # Suppress all errors for individual messages
+                print(f"[handle_topic] outer msg_id={msg_id}: {type(outer_err).__name__}: {outer_err}")
                 continue
         
         # Update status when complete
@@ -1870,70 +1875,86 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     upsta = None
     down_event = None
     up_event = None
+    file = None
+    use_ram = False
+
+    # msgid — unique key for progress tracking (not message.id which is shared across all calls)
+    prog_key = msgid
 
     if show_progress:
         smsg = await client.send_message(message.chat.id, 'Downloading', reply_to_message_id=message.id)
         down_event = asyncio.Event()
-        dosta = asyncio.create_task(downstatus(client, message.id, smsg, down_event))
+        dosta = asyncio.create_task(downstatus(client, prog_key, smsg, down_event))
 
     # Download — har doim diskka (progress RAMda saqlanadi)
-    use_ram = False
-    file = None
     for dl_attempt in range(MAX_RETRIES):
-        try:
-            if show_progress:
-                file = await acc.download_media(msg, progress=progress, progress_args=[message, "down"])
-            else:
-                file = await acc.download_media(msg)
+            try:
+                if show_progress:
+                    file = await acc.download_media(msg, progress=progress, progress_args=[prog_key, "down"])
+                else:
+                    file = await acc.download_media(msg)
 
-            # downstatus loopini to'xtatish
-            if down_event:
-                down_event.set()
-            break  # Muvaffaqiyat
-        except Exception as e:
-            error_str = str(e).lower()
-            if "downloadable media" in error_str:
-                if smsg:
-                    await client.delete_messages(message.chat.id, [smsg.id])
+                # downstatus loopini to'xtatish
                 if down_event:
                     down_event.set()
+                break  # Muvaffaqiyat
+            except Exception as e:
+                error_str = str(e).lower()
+                if "downloadable media" in error_str:
+                    if smsg:
+                        await client.delete_messages(message.chat.id, [smsg.id])
+                        smsg = None
+                    if down_event:
+                        down_event.set()
+                    return
+
+                # For network errors, retry
+                if "connection" in error_str or "network" in error_str or "timeout" in error_str:
+                    if dl_attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (dl_attempt + 1))
+                        continue
+
+                # For other errors, show error and return
+                if smsg:
+                    await client.delete_messages(message.chat.id, [smsg.id])
+                    smsg = None
+                if down_event:
+                    down_event.set()
+                if "error downloading" not in error_str:
+                    await client.send_message(
+                        message.chat.id,
+                        f"❌ **Download xatosi ({msgid}):** `{e}`",
+                        reply_to_message_id=message.id
+                    )
                 return
-
-            # For network errors, retry
-            if "connection" in error_str or "network" in error_str or "timeout" in error_str:
-                if dl_attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAY * (dl_attempt + 1))  # Exponential backoff
-                    continue
-
-            # For other errors, delete status message and show error
-            if smsg:
-                await client.delete_messages(message.chat.id, [smsg.id])
-            if down_event:
-                down_event.set()
-
-            # Don't show "Error downloading" messages as they might confuse users
-            if "error downloading" not in str(e).lower():
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-            return
 
     if not file:
         if smsg:
             await client.delete_messages(message.chat.id, [smsg.id])
+            smsg = None
         if down_event:
             down_event.set()
-        await client.send_message(message.chat.id, "Failed to download media", reply_to_message_id=message.id)
+        await client.send_message(
+            message.chat.id,
+            f"❌ **Download muvaffaqiyatsiz ({msgid})**",
+            reply_to_message_id=message.id
+        )
         return
 
     # Absolute path — faqat str path uchun (BytesIO emas)
     if isinstance(file, str):
         file = os.path.abspath(file)
-
         if not os.path.exists(file):
             if smsg:
                 await client.delete_messages(message.chat.id, [smsg.id])
+                smsg = None
             if down_event:
                 down_event.set()
-            await client.send_message(message.chat.id, f"**Download xatosi:** fayl topilmadi: `{file}`", reply_to_message_id=message.id)
+            await client.send_message(
+                message.chat.id,
+                f"**Download xatosi:** fayl topilmadi: `{file}`",
+                reply_to_message_id=message.id
+            )
             return
 
     if show_progress and smsg:
@@ -2159,13 +2180,23 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         if second_caption:
             await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
 
-    if isinstance(file, str) and os.path.exists(file):
-        os.remove(file)
-    # upstatus loopini to'xtatish
-    if up_event:
+    # Downloaded faylni tozalash
+    if isinstance(file, str) and file and os.path.exists(file):
+        try:
+            os.remove(file)
+        except Exception:
+            pass
+
+    # upstatus va progress tozalash
+    if up_event and not up_event.is_set():
         up_event.set()
+    if upsta and not upsta.done():
+        upsta.cancel()
     if smsg:
-        await client.delete_messages(message.chat.id, [smsg.id])
+        try:
+            await client.delete_messages(message.chat.id, [smsg.id])
+        except Exception:
+            pass
 
 # get the type of message
 def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
