@@ -4,6 +4,7 @@
 
 import asyncio 
 import pyrogram
+import logging
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated, UserAlreadyParticipant, InviteHashExpired, UsernameNotOccupied
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message 
@@ -25,6 +26,8 @@ import io
 import aiofiles
 from TechVJ.progress_store import write_progress, read_progress, clear_progress
 from TechVJ.buffer_manager import buffer_mgr
+
+logger = logging.getLogger(__name__)
 
 _bot_id_cache = None
 _bot_username_cache = None
@@ -1561,13 +1564,31 @@ async def handle_comment_thread(client: Client, message: Message, url):
         await safe_disconnect(acc)
 
 # Handle topic posts
+async def safe_send_message(client: Client, user_id: int, text: str, **kwargs):
+    """
+    Safely send a message using bot client, fallback to logging if USER_IS_BOT error occurs.
+    This handles cases where the recipient is a bot or restricted.
+    """
+    try:
+        return await client.send_message(user_id, text, **kwargs)
+    except Exception as e:
+        error_str = str(e)
+        # Check if the error is because recipient is a bot
+        if "USER_IS_BOT" in error_str or "user is bot" in error_str.lower():
+            logger.warning(f"Cannot send message to {user_id}: Bot cannot message other bots. Error: {e}")
+            print(f"[safe_send_message] Cannot send to {user_id}: {e}")
+            return None
+        else:
+            # Re-raise other errors
+            raise
+
 async def handle_topic(client: Client, message: Message, url):
     # Parse the URL to extract chat_id, topic_id, and message range
     # Example: https://t.me/c/2346917200/923/924-948
     topic_match = re.search(r'https://t\.me/c/(\d+)/(\d+)/(\d+)(?:-(\d+))?', url)
     
     if not topic_match:
-        await client.send_message(message.chat.id, "Invalid topic link format. Please use format: https://t.me/c/{chat_id}/{topic_id}/{message_id} or https://t.me/c/{chat_id}/{topic_id}/{start_id}-{end_id}", reply_to_message_id=message.id)
+        await safe_send_message(client, message.chat.id, "Invalid topic link format. Please use format: https://t.me/c/{chat_id}/{topic_id}/{message_id} or https://t.me/c/{chat_id}/{topic_id}/{start_id}-{end_id}", reply_to_message_id=message.id)
         return
     
     chat_id = int("-100" + topic_match.group(1))
@@ -1584,18 +1605,18 @@ async def handle_topic(client: Client, message: Message, url):
     # Get user session
     user_data = database.find_one({'chat_id': message.chat.id})
     if not get(user_data, 'logged_in', False) or user_data['session'] is None:
-        await client.send_message(message.chat.id, strings['need_login'])
+        await safe_send_message(client, message.chat.id, strings['need_login'])
         return
     
     # Connect with user's session
     acc, error = await create_client_session(user_data['session'])
     if error:
-        await client.send_message(message.chat.id, error)
+        await safe_send_message(client, message.chat.id, error)
         return
     
     try:
         # Inform the user about processing
-        status_msg = await client.send_message(message.chat.id, f"Processing topic posts from {min_id} to {max_id} in topic {topic_id}...", reply_to_message_id=message.id)
+        status_msg = await safe_send_message(client, message.chat.id, f"Processing topic posts from {min_id} to {max_id} in topic {topic_id}...", reply_to_message_id=message.id)
         
         # Get messages from the topic
         processed_count = 0
@@ -1626,7 +1647,8 @@ async def handle_topic(client: Client, message: Message, url):
                             
                             # Check if the message has any entities (like URLs)
                             if hasattr(msg, 'entities') and msg.entities:
-                                await client.send_message(
+                                await safe_send_message(
+                                    client,
                                     message.chat.id,
                                     msg.text,
                                     entities=msg.entities,
@@ -1637,7 +1659,8 @@ async def handle_topic(client: Client, message: Message, url):
                                 )
                             else:
                                 # If no entities, send regular text
-                                await client.send_message(
+                                await safe_send_message(
+                                    client,
                                     message.chat.id,
                                     msg.text,
                                     reply_to_message_id=message.id,
@@ -1668,14 +1691,18 @@ async def handle_topic(client: Client, message: Message, url):
                 print(f"[handle_topic] outer msg_id={msg_id}: {type(outer_err).__name__}: {outer_err}")
                 continue
         
-        # Update status when complete
-        if processed_count > 0:
-            await client.edit_message_text(message.chat.id, status_msg.id, f"Topic download completed! Processed {processed_count} messages.")
-        else:
-            await client.edit_message_text(message.chat.id, status_msg.id, "No messages could be processed from this topic.")
+        # Update status when complete (use safe send in case status_msg is None)
+        if status_msg:
+            try:
+                if processed_count > 0:
+                    await client.edit_message_text(message.chat.id, status_msg.id, f"Topic download completed! Processed {processed_count} messages.")
+                else:
+                    await client.edit_message_text(message.chat.id, status_msg.id, "No messages could be processed from this topic.")
+            except Exception as edit_err:
+                logger.warning(f"Could not edit status message: {edit_err}")
         
     except Exception as e:
-        await client.send_message(message.chat.id, f"Error processing topic: {e}", reply_to_message_id=message.id)
+        await safe_send_message(client, message.chat.id, f"Error processing topic: {e}", reply_to_message_id=message.id)
     finally:
         await safe_disconnect(acc)
 
