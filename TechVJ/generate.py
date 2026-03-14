@@ -94,30 +94,23 @@ async def main(bot: Client, message: Message):
                 await two_step_msg.reply('**Invalid Password Provided**')
                 return
         string_session = await client.export_session_string()
+        # is_premium ni disconnect dan OLDIN aniqlash
+        try:
+            me = await client.get_me()
+            is_premium = getattr(me, 'is_premium', False) or False
+        except Exception:
+            is_premium = False
         await client.disconnect()
         if len(string_session) < SESSION_STRING_SIZE:
             return await message.reply('<b>invalid session sring</b>')
         try:
             user_data = database.find_one({"chat_id": message.from_user.id})
             if user_data is not None:
-                # is_premium flagini aniqlash
-                try:
-                    me = await client.get_me()
-                    is_premium = getattr(me, 'is_premium', False) or False
-                except Exception:
-                    is_premium = False
-
                 data = {
                     'session': string_session,
                     'logged_in': True,
                     'is_premium': is_premium,
                 }
-
-                # Create a new session file for the user client
-                user_session_path = f"sessions/user_{user_id}"
-                uclient = Client(user_session_path, api_id=API_ID, api_hash=API_HASH)
-                uclient.session_string = data['session']
-                await uclient.connect()
 
                 database.update_one({'_id': user_data['_id']}, {'$set': data})
         except Exception as e:

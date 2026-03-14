@@ -92,8 +92,9 @@ class Bot(Client):
                 raise
             except FloodWait as e:
                 # For these errors, we'll retry with backoff
-                wait_time = getattr(e, 'x', RETRY_DELAY * (attempt + 1))
-                logger.warning(f"Connection error: {e}. Retrying in {wait_time} seconds...")
+                # pyrofork: e.value; eski pyrogram: e.x
+                wait_time = getattr(e, 'value', None) or getattr(e, 'x', RETRY_DELAY * (attempt + 1))
+                logger.warning(f"FloodWait: {wait_time}s kutilmoqda...")
                 await asyncio.sleep(wait_time)
             except OSError as e:
                 # Handle network-related OS errors

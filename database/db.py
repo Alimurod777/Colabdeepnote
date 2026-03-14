@@ -75,8 +75,9 @@ def insert_one(doc):
         _cache[key] = doc
 
 
-def update_one(filter_query, update):
+def update_one(filter_query, update, upsert=False):
     set_data = update.get("$set", {})
+    unset_fields = update.get("$unset", {})
 
     # Determine cache key
     key = filter_query.get("chat_id")
@@ -87,7 +88,7 @@ def update_one(filter_query, update):
             key = _cache_key_by_id(doc_id)
 
     if _use_mongo:
-        _db.update_one(filter_query, update)
+        _db.update_one(filter_query, update, upsert=upsert)
     else:
         records = _load_local()
         matched = False
@@ -96,18 +97,34 @@ def update_one(filter_query, update):
             if filter_query.get("chat_id"):
                 if r.get("chat_id") == filter_query["chat_id"]:
                     r.update(set_data)
+                    for uf in unset_fields:
+                        r.pop(uf, None)
                     matched = True
             elif filter_query.get("_id"):
                 # In local mode, _id is not auto-set — match via cache lookup
                 if key and r.get("chat_id") == key:
                     r.update(set_data)
+                    for uf in unset_fields:
+                        r.pop(uf, None)
                     matched = True
+        if not matched and upsert:
+            # Upsert: yangi hujjat yaratish
+            new_doc = dict(filter_query)
+            new_doc.update(set_data)
+            records.append(new_doc)
+            if not key:
+                key = new_doc.get("chat_id")
+            if key:
+                _cache[key] = new_doc
+            matched = True
         if matched:
             _save_local(records)
 
     # Update cache
     if key and key in _cache:
         _cache[key].update(set_data)
+        for uf in unset_fields:
+            _cache[key].pop(uf, None)
 
 
 def _cache_key_by_id(doc_id):

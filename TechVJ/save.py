@@ -1195,6 +1195,16 @@ async def cancel_command(client: Client, message: Message):
 
 @Client.on_message(filters.text & filters.private & ~filters.command(["start", "help", "cancel", "info"]))
 async def save(client: Client, message: Message):
+    # Avval post limit input tekshiruvi (custom post count so'ralganda)
+    post_limit_data = database.find_one({
+        'chat_id': message.chat.id,
+        'expecting_post_limit': True
+    })
+    if post_limit_data and 'post_limit_data' in post_limit_data:
+        await handle_post_limit_input(client, message)
+        # Agar URL bo'lmasa, qaytib chiqamiz (raqam yoki noto'g'ri kiritish)
+        if "https://t.me/" not in message.text:
+            return
     try:
         if "https://t.me/" in message.text:
             # Process the URL to determine what type of link it is
@@ -1847,7 +1857,6 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                         await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
                 return
             
-            chat = message.chat.id
             break  # Success, exit retry loop
         except Exception as e:
             error_str = str(e).lower()
@@ -1989,9 +1998,6 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         up_event = asyncio.Event()
         upsta = asyncio.create_task(upstatus(client, smsg.id, smsg, up_event))
 
-    # Bot ID olish (user session upload uchun)
-    bot_id = await _get_bot_id(client)
-
     # Handle captions with proper markdown formatting
     caption = None
     
@@ -2049,7 +2055,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=bot_id,
+            target_chat=message.chat.id,
             msg_type=doc_msg_type,
             extra=extra,
             file_size=file_size,
@@ -2070,7 +2076,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=bot_id,
+            target_chat=message.chat.id,
             msg_type="Video",
             extra=extra,
             file_size=file_size,
@@ -2090,7 +2096,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=bot_id,
+            target_chat=message.chat.id,
             msg_type="VideoNote",
             extra=extra,
             file_size=file_size,
@@ -2107,7 +2113,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=bot_id,
+            target_chat=message.chat.id,
             msg_type="Voice",
             extra=extra,
             file_size=file_size,
@@ -2128,7 +2134,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=bot_id,
+            target_chat=message.chat.id,
             msg_type="Audio",
             extra=extra,
             file_size=file_size,
@@ -2144,7 +2150,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=bot_id,
+            target_chat=message.chat.id,
             msg_type="Photo",
             file_size=file_size,
             use_ram=use_ram,
@@ -2159,7 +2165,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=bot_id,
+            target_chat=message.chat.id,
             msg_type="Animation",
             file_size=file_size,
             use_ram=use_ram,
@@ -2174,24 +2180,11 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=bot_id,
+            target_chat=message.chat.id,
             msg_type="Sticker",
             file_size=file_size,
             use_ram=use_ram,
         )
-
-    elif msg.media == MessageMediaType.VENUE:
-        return "Venue"
-    elif msg.media == 'web_page':
-        try:
-            # Check for web preview more safely
-            if getattr(msg, 'web_preview', None) or getattr(msg, 'web_page', None):
-                return "WebPage"
-            return "Text"  # Fallback to text if web_page attribute is empty
-        except Exception:
-            return "Text"  # Fallback to text if any error occurs with web_page
-    elif msg.media == MessageMediaType.DICE:
-        return "Dice"
 
     else:
         await upload_via_user_session(
@@ -2200,7 +2193,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=bot_id,
+            target_chat=message.chat.id,
             msg_type="Document",
             file_size=file_size,
             use_ram=use_ram,
@@ -2729,8 +2722,7 @@ async def cancel_post_callback(client: Client, callback_query):
         "Post download cancelled."
     )
 
-# Add a handler for numeric input after custom post count was requested
-@Client.on_message(filters.text & filters.private & ~filters.command(["start", "help", "cancel", "info"]))
+# Post limit input handler (decorator yo'q — save() ichidan chaqiriladi)
 async def handle_post_limit_input(client: Client, message: Message):
     # Check if we're expecting a post limit input from this user
     user_data = database.find_one({
