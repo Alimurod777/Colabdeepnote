@@ -20,6 +20,7 @@ import html
 from config import API_ID, API_HASH
 from database.db import database 
 from TechVJ.strings import strings, HELP_TXT
+from TechVJ.flood_control import flood_controller
 import subprocess
 import shutil
 import io
@@ -204,6 +205,7 @@ async def upload_via_user_session(
     extra: dict = None,
     file_size: int = 0,             # RAM release uchun
     use_ram: bool = False,          # RAM buffer bo'ldimi?
+    existing_client=None,           # Tayyor ulanish (acc) — yangi session yaratmaydi
 ):
     """
     Faylni user session orqali target_chat ga yuboradi.
@@ -211,6 +213,8 @@ async def upload_via_user_session(
     Bot API emas — userbot client (uclient) ishlatiladi.
     FloodWait avtomatik boshqariladi.
     file_path str yoki io.BytesIO bo'lishi mumkin.
+    existing_client berilsa — yangi ulanish yaratmaydi, shu clientni ishlatadi
+    va disconnect QILMAYDI (tashqi kod javobgar).
     """
     from database.db import database as _db
     from config import API_ID, API_HASH
@@ -222,16 +226,9 @@ async def upload_via_user_session(
     if isinstance(file_path, str):
         file_path = os.path.abspath(file_path)
         if not os.path.exists(file_path):
-            await bot.send_message(user_id, f"**Upload xatosi:** fayl topilmadi: `{file_path}`")
+            await safe_send_message(bot, user_id, f"**Upload xatosi:** fayl topilmadi: `{file_path}`")
             return False
     # io.BytesIO uchun tekshiruv yo'q
-
-    user_data = _db.find_one({"chat_id": user_id})
-    if not user_data or not user_data.get("session"):
-        await bot.send_message(user_id, "**Avval /login yoki /qrlogin qiling.**")
-        return False
-
-    session_string = user_data["session"]
 
     # Target chat: bot bilan private chat yoki fallback user_id
     chat_id = target_chat or user_id
@@ -241,35 +238,55 @@ async def upload_via_user_session(
     if msg_type in ("Document", "Video", "Audio") and isinstance(file_path, str):
         thumb = extra.get("thumb") or await make_thumbnail(file_path)
 
-    is_premium_hint = bool(user_data.get("is_premium", False))
-    uclient = Client(
-        f"user_{user_id}",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        session_string=session_string,
-        in_memory=True,
-        no_updates=True,
-        sleep_threshold=60,
-    )
+    # ── existing_client bo'lsa — yangi session yaratmaymiz ──
+    own_client = existing_client is None  # Biz yaratgan client mi?
+
+    if existing_client:
+        uclient = existing_client
+    else:
+        user_data = _db.find_one({"chat_id": user_id})
+        if not user_data or not user_data.get("session"):
+            await safe_send_message(bot, user_id, "**Avval /login yoki /qrlogin qiling.**")
+            return False
+        session_string = user_data["session"]
+        uclient = Client(
+            f"user_{user_id}",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=session_string,
+            in_memory=True,
+            no_updates=True,
+            sleep_threshold=60,
+        )
 
     success = True
 
     try:
         try:
-            await uclient.connect()
-            # self.me ni to'ldirish — save_file.py ichida is_premium tekshiriladi
-            uclient.me = await uclient.get_me()
-            # Bot peer'ini uclient cache ga yuklash — PEER_ID_INVALID oldini olish.
-            # uclient yangi session bo'lgani uchun bot peer'ini bilmaydi.
-            # Har doim username bilan resolve — raqamli ID access_hash=0 beradi (xato).
-            try:
-                if _bot_username_cache:
-                    await uclient.get_users(_bot_username_cache)
-                else:
-                    # username yo'q — InputPeerUser bilan resolve
-                    await uclient.get_users(chat_id)
-            except Exception:
-                pass
+            if own_client:
+                await uclient.connect()
+                # self.me ni to'ldirish — save_file.py ichida is_premium tekshiriladi
+                uclient.me = await uclient.get_me()
+                # Bot peer'ini uclient cache ga yuklash — PEER_ID_INVALID oldini olish.
+                try:
+                    if _bot_username_cache:
+                        await uclient.get_users(_bot_username_cache)
+                    else:
+                        await uclient.get_users(chat_id)
+                except Exception:
+                    pass
+            else:
+                # existing_client da me bo'lmasa to'ldiramiz
+                if not getattr(uclient, 'me', None):
+                    uclient.me = await uclient.get_me()
+                # Bot peer'ini resolve qilamiz
+                try:
+                    if _bot_username_cache:
+                        await uclient.get_users(_bot_username_cache)
+                    else:
+                        await uclient.get_users(chat_id)
+                except Exception:
+                    pass
             # ── Premium check → split qaror ──
             is_premium = getattr(uclient.me, 'is_premium', False)
             # BytesIO uchun getsize ishlamaydi — tashqaridan kelgan file_size ishlatiladi
@@ -290,10 +307,10 @@ async def upload_via_user_session(
 
             parts_to_cleanup = [p for p in parts if isinstance(p, str) and p != file_path]
         except Exception as conn_err:
-            await bot.send_message(user_id, f"**Ulanish xatosi:** `{conn_err}`")
+            await safe_send_message(bot, user_id, f"**Ulanish xatosi:** `{conn_err}`")
             return False
 
-        # ── Helper: bitta partni yuborish (DRY) ──
+        # ── Helper: bitta partni yuborish (DRY) + Flood Protection ──
         async def _do_send_part(part_path, part_caption, part_idx, total_parts):
             """Bitta part ni uclient orqali yuboradi. True/False qaytaradi."""
 
@@ -304,6 +321,9 @@ async def upload_via_user_session(
 
             for attempt in range(5):
                 try:
+                    # Flood wait tekshiruvi
+                    await flood_controller.wait_if_needed(user_id)
+                    
                     if msg_type == "Video":
                         await uclient.send_video(
                             chat_id=chat_id, video=part_path,
@@ -363,6 +383,9 @@ async def upload_via_user_session(
                     return True
                 except FloodWait as e:
                     wait = e.value
+                    # Flood controller'ga xabar berish
+                    await flood_controller.handle_flood_wait(user_id, wait)
+                    
                     if progress_msg:
                         try:
                             if total_parts > 1:
@@ -404,6 +427,9 @@ async def upload_via_user_session(
                     return False, err
                 if not uploaded:
                     return False, None
+                # Minimal delay between parts to prevent flood
+                if idx < len(parts_list) - 1:
+                    await asyncio.sleep(1)
             return True, None
 
         # ── Primary upload ──
@@ -425,16 +451,16 @@ async def upload_via_user_session(
                 ok, err = await _upload_parts(parts)
                 if not ok:
                     if err is not None:
-                        await bot.send_message(user_id, f"**Upload xatosi:** `{err}`")
+                        await safe_send_message(bot, user_id, f"**Upload xatosi:** `{err}`")
                     else:
-                        await bot.send_message(user_id, "**Upload: FloodWait — maksimal urinishlar tugadi.**")
+                        await safe_send_message(bot, user_id, "**Upload: FloodWait — maksimal urinishlar tugadi.**")
                     success = False
             else:
-                await bot.send_message(user_id, f"**Upload xatosi:** `{err}`")
+                await safe_send_message(bot, user_id, f"**Upload xatosi:** `{err}`")
                 success = False
         elif not ok:
             # FloodWait tugadi (exception yo'q)
-            await bot.send_message(user_id, "**Upload: FloodWait — maksimal urinishlar tugadi.**")
+            await safe_send_message(bot, user_id, "**Upload: FloodWait — maksimal urinishlar tugadi.**")
             success = False
 
         # ── Multi-part muvaffaqiyat xabari ──
@@ -452,10 +478,13 @@ async def upload_via_user_session(
                 pass
 
     finally:
-        try:
-            await uclient.disconnect()
-        except Exception:
-            pass
+        # Faqat o'zimiz yaratgan clientni disconnect qilamiz
+        # existing_client berilgan bo'lsa — disconnect tashqi kodda (process_posts finally)
+        if own_client:
+            try:
+                await uclient.disconnect()
+            except Exception:
+                pass
         # RAM yoki disk tozalash
         if use_ram and file_size > 0:
             await buffer_mgr.release(file_size)
@@ -1719,28 +1748,72 @@ async def handle_topic(client: Client, message: Message, url):
 
 # handle private
 async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
+    """Wrapper — download qilingan faylni har qanday holatda tozalaydi."""
+    file = None
+    smsg = None
+    down_event = None
+    up_event = None
+    dosta = None
+    upsta = None
+    try:
+        file, smsg, down_event, up_event, dosta, upsta = await _handle_private_inner(
+            client, acc, message, chatid, msgid
+        )
+    except BaseException:
+        # CancelledError ham ushlanadi
+        raise
+    finally:
+        # ── Fayl tozalash — har doim (success, error, cancel) ──
+        if isinstance(file, str) and file and os.path.exists(file):
+            try:
+                os.remove(file)
+            except Exception:
+                pass
+        # upstatus va progress tozalash
+        if up_event and not up_event.is_set():
+            up_event.set()
+        if upsta and not upsta.done():
+            upsta.cancel()
+        if down_event and not down_event.is_set():
+            down_event.set()
+        if dosta and not dosta.done():
+            dosta.cancel()
+        if smsg:
+            try:
+                await client.delete_messages(message.chat.id, [smsg.id])
+            except Exception:
+                pass
+
+
+_EMPTY = (None, None, None, None, None, None)  # file, smsg, down_event, up_event, dosta, upsta
+
+
+async def _handle_private_inner(client: Client, acc, message: Message, chatid: int, msgid: int):
+    # Bot ID ni olish — user session bot chatiga yuborish uchun
+    bot_id = await _get_bot_id(client)
     # Add retry mechanism for network errors
     for attempt in range(MAX_RETRIES):
         try:
             msg: Message = await acc.get_messages(chatid, msgid)
             if not msg:
-                return  # Silently ignore if message not found
+                return _EMPTY  # Silently ignore if message not found
 
             msg_type = get_message_type(msg)
             
             # Handle polls specially
             if msg_type == "Poll" and hasattr(msg, "poll") and msg.poll is not None:
                 await handle_poll(client, message, msg.poll)
-                return
+                return _EMPTY
             elif msg_type == "Poll" and (not hasattr(msg, "poll") or msg.poll is None):
                 # If it's a poll type but the poll object is missing, send a more helpful message
-                await client.send_message(
+                await safe_send_message(
+                    client,
                     message.chat.id,
                     "This message contains a poll, but the poll data couldn't be retrieved. This might be due to restricted access or the poll has expired.",
                     reply_to_message_id=message.id
                 )
-                return
-                
+                return _EMPTY
+
             # Handle WebPage specially - treat it as a text message with web preview
             if msg_type == "WebPage":
                 try:
@@ -1767,7 +1840,8 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                                 text_content = extract_hyperlinks(text_content, entities)
                         
                         # Send the message with web_page preview enabled
-                        await client.send_message(
+                        await safe_send_message(
+                            client,
                             message.chat.id,
                             text_content,
                             reply_to_message_id=message.id,
@@ -1777,25 +1851,27 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                         )
                     else:
                         # If no text, just send a message about the link
-                        await client.send_message(
-                            message.chat.id, 
-                            "This message contains a web link preview.", 
+                        await safe_send_message(
+                            client,
+                            message.chat.id,
+                            "This message contains a web link preview.",
                             reply_to_message_id=message.id,
                             reply_markup=reply_markup
                         )
-                    return
+                    return _EMPTY
                 except Exception as e:
                     # Handle WebPage errors gracefully
                     if "WEBPAGE_NOT_FOUND" in str(e) or "WEBPAGE_CURL_FAILED" in str(e):
-                        await client.send_message(
-                            message.chat.id, 
-                            f"Error: Could not generate preview for the webpage link. The website might be unavailable or blocking Telegram's preview feature.", 
+                        await safe_send_message(
+                            client,
+                            message.chat.id,
+                            f"Error: Could not generate preview for the webpage link. The website might be unavailable or blocking Telegram's preview feature.",
                             reply_to_message_id=message.id
                         )
                     else:
-                        await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-                    return
-            
+                        await safe_send_message(client, message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+                    return _EMPTY
+
             # If it's text-only message and has no downloadable media, handle it directly without showing errors
             if msg_type == "Text":
                 try:
@@ -1823,7 +1899,8 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                         if len(text_content) > 4096:  # Telegram message limit
                             parts = [text_content[i:i+4096] for i in range(0, len(text_content), 4096)]
                             for part in parts:
-                                await client.send_message(
+                                await safe_send_message(
+                                    client,
                                     message.chat.id,
                                     part,
                                     reply_to_message_id=message.id if parts.index(part) == 0 else None,
@@ -1831,7 +1908,8 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                                     parse_mode=ParseMode.MARKDOWN
                                 )
                         else:
-                            await client.send_message(
+                            await safe_send_message(
+                                client,
                                 message.chat.id,
                                 text_content,
                                 reply_to_message_id=message.id,
@@ -1840,29 +1918,39 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                             )
                     else:
                         # If no text, just send a blank message with the reply markup
-                        await client.send_message(
-                            message.chat.id, 
-                            "", 
+                        await safe_send_message(
+                            client,
+                            message.chat.id,
+                            "",
                             reply_to_message_id=message.id,
                             reply_markup=reply_markup
                         )
                     
-                    return
+                    return _EMPTY
                 except Exception as e:
                     # Only show error for non-empty message errors
                     if "400 MESSAGE_EMPTY" in str(e):
-                        await client.send_message(message.chat.id, f"Post ID: {msgid}", reply_to_message_id=message.id)
+                        await safe_send_message(client, message.chat.id, f"Post ID: {msgid}", reply_to_message_id=message.id)
                     # Silently ignore "downloadable media" errors
                     elif "downloadable media" not in str(e).lower():
-                        await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-                return
+                        await safe_send_message(client, message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+                return _EMPTY
             
             break  # Success, exit retry loop
+        except NotImplementedError:
+            # Pyrofork bu media turini qo'llab-quvvatlamaydi
+            # (masalan giveaway, story, invoice va h.k.)
+            await safe_send_message(
+                client, message.chat.id,
+                f"⚠️ **Post {msgid}:** Bu media turini yuklash hozircha qo'llab-quvvatlanmaydi.",
+                reply_to_message_id=message.id
+            )
+            return _EMPTY
         except Exception as e:
             error_str = str(e).lower()
             # Completely suppress these specific errors
             if "downloadable media" in error_str or "message_empty" in error_str or "400 message" in error_str:
-                return  # Silently ignore
+                return _EMPTY  # Silently ignore
             
             # For network errors, retry
             if "connection" in error_str or "network" in error_str or "timeout" in error_str:
@@ -1872,10 +1960,10 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             
             # For other errors, we'll still show them - except specific ones we want to handle
             if "400 MESSAGE_EMPTY" in str(e):
-                await client.send_message(message.chat.id, f"Post ID: {msgid}", reply_to_message_id=message.id)
+                await safe_send_message(client, message.chat.id, f"Post ID: {msgid}", reply_to_message_id=message.id)
             else:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-            return
+                await safe_send_message(client, message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+            return _EMPTY
 
     # Check if the message has downloadable media
     has_media = False
@@ -1886,7 +1974,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             
     # If there's no downloadable media, silently return
     if not has_media:
-        return
+        return _EMPTY
 
     # Check file size to determine if we need to show progress
     show_progress = True
@@ -1919,9 +2007,10 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     prog_key = msgid
 
     if show_progress:
-        smsg = await client.send_message(message.chat.id, 'Downloading', reply_to_message_id=message.id)
-        down_event = asyncio.Event()
-        dosta = asyncio.create_task(downstatus(client, prog_key, smsg, down_event))
+        smsg = await safe_send_message(client, message.chat.id, 'Downloading', reply_to_message_id=message.id)
+        if smsg:
+            down_event = asyncio.Event()
+            dosta = asyncio.create_task(downstatus(client, prog_key, smsg, down_event))
 
     # Download — har doim diskka (progress RAMda saqlanadi)
     for dl_attempt in range(MAX_RETRIES):
@@ -1939,11 +2028,14 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 error_str = str(e).lower()
                 if "downloadable media" in error_str:
                     if smsg:
-                        await client.delete_messages(message.chat.id, [smsg.id])
+                        try:
+                            await client.delete_messages(message.chat.id, [smsg.id])
+                        except Exception:
+                            pass
                         smsg = None
                     if down_event:
                         down_event.set()
-                    return
+                    return _EMPTY
 
                 # For network errors, retry
                 if "connection" in error_str or "network" in error_str or "timeout" in error_str:
@@ -1953,46 +2045,58 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
                 # For other errors, show error and return
                 if smsg:
-                    await client.delete_messages(message.chat.id, [smsg.id])
+                    try:
+                        await client.delete_messages(message.chat.id, [smsg.id])
+                    except Exception:
+                        pass
                     smsg = None
                 if down_event:
                     down_event.set()
                 if "error downloading" not in error_str:
-                    await client.send_message(
+                    await safe_send_message(
+                        client,
                         message.chat.id,
                         f"❌ **Download xatosi ({msgid}):** `{e}`",
                         reply_to_message_id=message.id
                     )
-                return
+                return _EMPTY
 
     if not file:
         if smsg:
-            await client.delete_messages(message.chat.id, [smsg.id])
+            try:
+                await client.delete_messages(message.chat.id, [smsg.id])
+            except Exception:
+                pass
             smsg = None
         if down_event:
             down_event.set()
-        await client.send_message(
+        await safe_send_message(
+            client,
             message.chat.id,
             f"❌ **Download muvaffaqiyatsiz ({msgid})**",
             reply_to_message_id=message.id
         )
-        return
+        return _EMPTY
 
     # Absolute path — faqat str path uchun (BytesIO emas)
     if isinstance(file, str):
         file = os.path.abspath(file)
         if not os.path.exists(file):
             if smsg:
-                await client.delete_messages(message.chat.id, [smsg.id])
+                try:
+                    await client.delete_messages(message.chat.id, [smsg.id])
+                except Exception:
+                    pass
                 smsg = None
             if down_event:
                 down_event.set()
-            await client.send_message(
+            await safe_send_message(
+                client,
                 message.chat.id,
                 f"**Download xatosi:** fayl topilmadi: `{file}`",
                 reply_to_message_id=message.id
             )
-            return
+            return _EMPTY
 
     if show_progress and smsg:
         up_event = asyncio.Event()
@@ -2055,14 +2159,15 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=message.chat.id,
+            target_chat=bot_id,
             msg_type=doc_msg_type,
             extra=extra,
             file_size=file_size,
             use_ram=use_ram,
+            existing_client=acc,
         )
         if second_caption:
-            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
+            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
 
     elif "Video" == msg_type:
         extra = {
@@ -2076,14 +2181,15 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=message.chat.id,
+            target_chat=bot_id,
             msg_type="Video",
             extra=extra,
             file_size=file_size,
             use_ram=use_ram,
+            existing_client=acc,
         )
         if second_caption:
-            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
+            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
 
     elif "VideoNote" == msg_type:
         extra = {
@@ -2096,11 +2202,12 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=message.chat.id,
+            target_chat=bot_id,
             msg_type="VideoNote",
             extra=extra,
             file_size=file_size,
             use_ram=use_ram,
+            existing_client=acc,
         )
 
     elif "Voice" == msg_type:
@@ -2113,14 +2220,15 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=message.chat.id,
+            target_chat=bot_id,
             msg_type="Voice",
             extra=extra,
             file_size=file_size,
             use_ram=use_ram,
+            existing_client=acc,
         )
         if second_caption:
-            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
+            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
 
     elif "Audio" == msg_type:
         extra = {
@@ -2134,14 +2242,15 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=message.chat.id,
+            target_chat=bot_id,
             msg_type="Audio",
             extra=extra,
             file_size=file_size,
             use_ram=use_ram,
+            existing_client=acc,
         )
         if second_caption:
-            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
+            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
 
     elif "Photo" == msg_type:
         await upload_via_user_session(
@@ -2150,13 +2259,14 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=message.chat.id,
+            target_chat=bot_id,
             msg_type="Photo",
             file_size=file_size,
             use_ram=use_ram,
+            existing_client=acc,
         )
         if second_caption:
-            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
+            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
 
     elif "Animation" == msg_type:
         await upload_via_user_session(
@@ -2165,13 +2275,14 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=message.chat.id,
+            target_chat=bot_id,
             msg_type="Animation",
             file_size=file_size,
             use_ram=use_ram,
+            existing_client=acc,
         )
         if second_caption:
-            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
+            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
 
     elif "Sticker" == msg_type:
         await upload_via_user_session(
@@ -2180,10 +2291,11 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=message.chat.id,
+            target_chat=bot_id,
             msg_type="Sticker",
             file_size=file_size,
             use_ram=use_ram,
+            existing_client=acc,
         )
 
     else:
@@ -2193,31 +2305,17 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             file_path=file,
             caption=first_caption,
             progress_msg=smsg,
-            target_chat=message.chat.id,
+            target_chat=bot_id,
             msg_type="Document",
             file_size=file_size,
             use_ram=use_ram,
+            existing_client=acc,
         )
         if second_caption:
-            await client.send_message(message.chat.id, second_caption, reply_to_message_id=message.id)
+            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
 
-    # Downloaded faylni tozalash
-    if isinstance(file, str) and file and os.path.exists(file):
-        try:
-            os.remove(file)
-        except Exception:
-            pass
-
-    # upstatus va progress tozalash
-    if up_event and not up_event.is_set():
-        up_event.set()
-    if upsta and not upsta.done():
-        upsta.cancel()
-    if smsg:
-        try:
-            await client.delete_messages(message.chat.id, [smsg.id])
-        except Exception:
-            pass
+    # Wrapper ga qaytarish — u finally da tozalaydi
+    return file, smsg, down_event, up_event, dosta, upsta
 
 # get the type of message
 def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
