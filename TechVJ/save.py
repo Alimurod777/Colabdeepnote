@@ -1200,128 +1200,6 @@ async def chat_info_command(client: Client, message: Message):
         # Always disconnect the client when done
         await safe_disconnect(acc)
 
-# message stats command
-@Client.on_message(filters.command(["msgstats"]))
-async def message_stats_command(client: Client, message: Message):
-    """Get detailed statistics about a message"""
-    # Check if message ID is provided
-    if len(message.text.split()) < 2:
-        # If replying to a message, use that message ID
-        if message.reply_to_message:
-            target_msg_id = message.reply_to_message.id
-            chat_id = message.chat.id
-        else:
-            await client.send_message(message.chat.id, "Please provide a message ID or reply to a message", reply_to_message_id=message.id)
-            return
-    else:
-        # Get the message ID
-        try:
-            target_msg_id = int(message.text.split()[1])
-            chat_id = message.chat.id
-            
-            # Check if chat ID is also provided
-            if len(message.text.split()) > 2:
-                chat_id = message.text.split()[2]
-        except ValueError:
-            await client.send_message(message.chat.id, "Invalid message ID format. Please provide a valid integer message ID.", reply_to_message_id=message.id)
-            return
-    
-    # Get user session string
-    user_data = database.find_one({'chat_id': message.chat.id})
-    
-    # Check if user is logged in
-    if user_data is None or not user_data.get('logged_in', False) or not user_data.get('session'):
-        await client.send_message(message.chat.id, strings['need_login'], reply_to_message_id=message.id)
-        return
-        
-    session_string = user_data.get('session')
-    
-    # Create user client
-    acc, err = await create_client_session(session_string, f"msg_stats_{message.chat.id}")
-    if err:
-        await client.send_message(message.chat.id, f"Failed to login: {err}", reply_to_message_id=message.id)
-        return
-        
-    try:
-        # Send "checking" message
-        stats_msg = await message.reply("Fetching message statistics...")
-        
-        # Get message details
-        msg_stats = await get_detailed_message_stats(acc, chat_id, target_msg_id)
-        
-        if "error" in msg_stats:
-            await stats_msg.edit_text(f"Error fetching message stats: {msg_stats['error']}")
-            return
-            
-        # Format message statistics
-        stats_text = "**Message Statistics**\n\n"
-        stats_text += f"**Message ID:** `{msg_stats['message_id']}`\n"
-        stats_text += f"**Views:** {msg_stats['views']}\n"
-        stats_text += f"**Date:** {msg_stats['date']}\n"
-        
-        if msg_stats.get('edit_date'):
-            stats_text += f"**Last Edited:** {msg_stats['edit_date']}\n"
-        
-        # Add forwarding info if applicable
-        if msg_stats.get('forwarded', False):
-            stats_text += f"\n**Forwarded:** Yes\n"
-            stats_text += f"**Forwarded Date:** {msg_stats.get('forward_date', 'Unknown')}\n"
-            
-            if msg_stats.get('forward_from_chat'):
-                fc = msg_stats['forward_from_chat']
-                stats_text += f"**Forwarded From:** {fc.get('title') or 'Unknown'}\n"
-                if fc.get('username'):
-                    stats_text += f"**Channel Username:** @{fc['username']}\n"
-                stats_text += f"**Channel ID:** `{fc.get('id')}`\n"
-                stats_text += f"**Channel Type:** {fc.get('type')}\n"
-            
-            elif msg_stats.get('forward_from_user'):
-                fu = msg_stats['forward_from_user']
-                name = f"{fu.get('first_name') or ''} {fu.get('last_name') or ''}".strip()
-                stats_text += f"**Forwarded From User:** {name}\n"
-                if fu.get('username'):
-                    stats_text += f"**Username:** @{fu['username']}\n"
-                stats_text += f"**User ID:** `{fu.get('id')}`\n"
-        
-        # Add reaction counts if available
-        if msg_stats.get('reactions'):
-            stats_text += "\n**Reactions:**\n"
-            for emoji, count in msg_stats['reactions'].items():
-                stats_text += f"{emoji}: {count}\n"
-        
-        # Add media info if available
-        if msg_stats.get('media_type'):
-            stats_text += f"\n**Media Type:** {msg_stats['media_type']}\n"
-            
-            # Add file details if available
-            if msg_stats.get('file_size'):
-                # Convert bytes to human-readable format
-                size_mb = round(msg_stats['file_size'] / 1024 / 1024, 2)
-                stats_text += f"**File Size:** {size_mb} MB\n"
-                
-            if msg_stats.get('file_name'):
-                stats_text += f"**File Name:** {msg_stats['file_name']}\n"
-                
-            if msg_stats.get('mime_type'):
-                stats_text += f"**MIME Type:** {msg_stats['mime_type']}\n"
-                
-            if msg_stats.get('photo_sizes'):
-                largest_size = msg_stats['photo_sizes'][-1]
-                stats_text += f"**Photo Size:** {largest_size.get('width')}×{largest_size.get('height')}\n"
-        
-        # Add reply info
-        if msg_stats.get('reply_to_message_id'):
-            stats_text += f"\n**Reply To:** `{msg_stats['reply_to_message_id']}`\n"
-        
-        # Update the message with the stats
-        await stats_msg.edit_text(stats_text, parse_mode=ParseMode.MARKDOWN)
-        
-    except Exception as e:
-        await message.reply(f"Error: {str(e)}")
-    finally:
-        # Always disconnect the client when done
-        await safe_disconnect(acc)
-
 # cancel command
 @Client.on_message(filters.command(["cancel"]))
 async def cancel_command(client: Client, message: Message):
@@ -1333,7 +1211,7 @@ async def cancel_command(client: Client, message: Message):
     else:
         await client.send_message(message.chat.id, "There is no ongoing task to cancel.", reply_to_message_id=message.id)
 
-@Client.on_message(filters.text & filters.private & ~filters.command(["start", "help", "cancel", "info"]))
+@Client.on_message(filters.text & filters.private & ~filters.command(["start", "help", "cancel", "info", "login", "logout", "qrlogin", "status", "chatinfo"]))
 async def save(client: Client, message: Message):
     # Avval post limit input tekshiruvi (custom post count so'ralganda)
     post_limit_data = database.find_one({
@@ -2302,9 +2180,9 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
 
     elif "Video" == msg_type:
         extra = {
-            "duration": msg.video.duration,
-            "width": msg.video.width,
-            "height": msg.video.height,
+            "duration": getattr(msg.video, 'duration', 0) if msg.video else 0,
+            "width": getattr(msg.video, 'width', 0) if msg.video else 0,
+            "height": getattr(msg.video, 'height', 0) if msg.video else 0,
         }
         await upload_via_user_session(
             bot=client,
@@ -2324,8 +2202,8 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
 
     elif "VideoNote" == msg_type:
         extra = {
-            "duration": msg.video_note.duration,
-            "length": msg.video_note.length,
+            "duration": getattr(msg.video_note, 'duration', 0) if msg.video_note else 0,
+            "length": getattr(msg.video_note, 'length', 0) if msg.video_note else 0,
         }
         await upload_via_user_session(
             bot=client,
@@ -2343,7 +2221,7 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
 
     elif "Voice" == msg_type:
         extra = {
-            "duration": msg.voice.duration,
+            "duration": getattr(msg.voice, 'duration', 0) if msg.voice else 0,
         }
         await upload_via_user_session(
             bot=client,
@@ -2363,9 +2241,9 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
 
     elif "Audio" == msg_type:
         extra = {
-            "duration": msg.audio.duration,
-            "performer": msg.audio.performer,
-            "title": msg.audio.title,
+            "duration": getattr(msg.audio, 'duration', 0) if msg.audio else 0,
+            "performer": getattr(msg.audio, 'performer', None) if msg.audio else None,
+            "title": getattr(msg.audio, 'title', None) if msg.audio else None,
         }
         await upload_via_user_session(
             bot=client,
@@ -3382,207 +3260,6 @@ async def get_chat_info(client, chat_id):
     except Exception as e:
         return {"error": str(e)}
         
-async def get_detailed_message_stats(client, chat_id, message_id):
-    """
-    Get detailed message statistics using Raw API functions
-    
-    Args:
-        client: The pyrogram client
-        chat_id: Chat ID where message is located
-        message_id: Message ID to get stats for
-        
-    Returns:
-        Dictionary with detailed message statistics
-    """
-    try:
-        # Convert chat_id to InputPeer
-        if isinstance(chat_id, str):
-            if chat_id.startswith('@'):
-                chat = await client.get_chat(chat_id)
-                peer = await client.resolve_peer(chat.id)
-            else:
-                peer = await client.resolve_peer(chat_id)
-        else:
-            peer = await client.resolve_peer(chat_id)
-
-        # Get message views using raw API
-        result = await client.send(
-            functions.messages.GetMessagesViews(
-                peer=peer,
-                id=[message_id],
-                increment=False
-            )
-        )
-        
-        # Get additional message info
-        messages = await client.get_messages(chat_id, [message_id])
-        if not messages or not messages[0]:
-            return {"error": "Message not found"}
-            
-        message = messages[0]
-        
-        # Initialize stats dictionary
-        stats = {
-            "message_id": message_id,
-            "views": result.views[0] if result.views else 0,
-            "date": message.date.strftime("%Y-%m-%d %H:%M:%S") if message.date else None,
-            "edit_date": message.edit_date.strftime("%Y-%m-%d %H:%M:%S") if message.edit_date else None,
-        }
-        
-        # Get forwarded info if available
-        if message.forward_date:
-            stats["forwarded"] = True
-            stats["forward_date"] = message.forward_date.strftime("%Y-%m-%d %H:%M:%S")
-            
-            if message.forward_from_chat:
-                stats["forward_from_chat"] = {
-                    "id": message.forward_from_chat.id,
-                    "title": message.forward_from_chat.title if hasattr(message.forward_from_chat, "title") else None,
-                    "username": message.forward_from_chat.username if hasattr(message.forward_from_chat, "username") else None,
-                    "type": message.forward_from_chat.type
-                }
-                
-            elif message.forward_from:
-                stats["forward_from_user"] = {
-                    "id": message.forward_from.id,
-                    "first_name": message.forward_from.first_name if hasattr(message.forward_from, "first_name") else None,
-                    "last_name": message.forward_from.last_name if hasattr(message.forward_from, "last_name") else None,
-                    "username": message.forward_from.username if hasattr(message.forward_from, "username") else None
-                }
-        else:
-            stats["forwarded"] = False
-            
-        # Get reaction counts if available
-        if hasattr(message, "reactions") and message.reactions:
-            stats["reactions"] = {}
-            for reaction in message.reactions.reactions:
-                stats["reactions"][reaction.emoji] = reaction.count
-                
-        # Get additional stats based on message type
-        if message.media:
-            stats["media_type"] = str(message.media)
-            
-            # Try to get file details for media messages
-            if message.document:
-                stats["file_size"] = message.document.file_size
-                stats["file_name"] = message.document.file_name if hasattr(message.document, "file_name") else None
-                stats["mime_type"] = message.document.mime_type if hasattr(message.document, "mime_type") else None
-                
-            elif message.photo:
-                # Photo has width/height at top level, thumbs for thumbnails
-                stats["photo_size"] = {"width": message.photo.width, "height": message.photo.height}
-                stats["file_size"] = message.photo.file_size
-        
-        # Try to get reply info
-        if message.reply_to_message_id:
-            stats["reply_to_message_id"] = message.reply_to_message_id
-            
-        return stats
-        
-    except Exception as e:
-        return {"error": str(e)}
-        
-async def get_channel_members_info(client, chat_id, limit=100):
-    """
-    Get detailed information about channel members using Raw API
-    
-    Args:
-        client: The pyrogram client
-        chat_id: Chat ID to get member info
-        limit: Maximum number of members to retrieve (default: 100)
-        
-    Returns:
-        List of member information
-    """
-    try:
-        # Convert chat_id to InputPeer
-        if isinstance(chat_id, str):
-            if chat_id.startswith('@'):
-                chat = await client.get_chat(chat_id)
-                peer = await client.resolve_peer(chat.id)
-            else:
-                peer = await client.resolve_peer(chat_id)
-        else:
-            peer = await client.resolve_peer(chat_id)
-            
-        # Get channel participants using raw API
-        participants = await client.send(
-            functions.channels.GetParticipants(
-                channel=peer,
-                filter=types.ChannelParticipantsRecent(),
-                offset=0,
-                limit=limit,
-                hash=0
-            )
-        )
-        
-        # Process participant information
-        members = []
-        for participant in participants.participants:
-            user_id = participant.user_id
-            
-            # Get the user from participants.users list
-            user = None
-            for u in participants.users:
-                if u.id == user_id:
-                    user = u
-                    break
-                    
-            if not user:
-                continue
-                
-            # Basic user info
-            member_info = {
-                "id": user.id,
-                "first_name": user.first_name if hasattr(user, "first_name") else None,
-                "last_name": user.last_name if hasattr(user, "last_name") else None,
-                "username": user.username if hasattr(user, "username") else None,
-            }
-            
-            # Check user status
-            if hasattr(user, "status"):
-                if isinstance(user.status, types.UserStatusOnline):
-                    member_info["status"] = "online"
-                    member_info["expires"] = user.status.expires
-                elif isinstance(user.status, types.UserStatusOffline):
-                    member_info["status"] = "offline"
-                    member_info["last_online"] = user.status.was_online
-                elif isinstance(user.status, types.UserStatusRecently):
-                    member_info["status"] = "recently"
-                elif isinstance(user.status, types.UserStatusLastWeek):
-                    member_info["status"] = "last_week"
-                elif isinstance(user.status, types.UserStatusLastMonth):
-                    member_info["status"] = "last_month"
-                else:
-                    member_info["status"] = "unknown"
-            
-            # Check participant type and privileges
-            if isinstance(participant, types.ChannelParticipantAdmin):
-                member_info["role"] = "admin"
-                if hasattr(participant, "admin_rights"):
-                    member_info["permissions"] = {
-                        "change_info": participant.admin_rights.change_info,
-                        "post_messages": participant.admin_rights.post_messages,
-                        "edit_messages": participant.admin_rights.edit_messages,
-                        "delete_messages": participant.admin_rights.delete_messages,
-                        "ban_users": participant.admin_rights.ban_users,
-                        "invite_users": participant.admin_rights.invite_users,
-                        "pin_messages": participant.admin_rights.pin_messages,
-                        "add_admins": participant.admin_rights.add_admins
-                    }
-            elif isinstance(participant, types.ChannelParticipantCreator):
-                member_info["role"] = "creator"
-            else:
-                member_info["role"] = "member"
-                
-            # Add to members list
-            members.append(member_info)
-            
-        return members
-        
-    except Exception as e:
-        return {"error": str(e)}
-        
 async def download_media_with_raw_api(client, message, file_path=None, progress_callback=None):
     """
     Download media using pyrogram's built-in download_media.
@@ -3678,102 +3355,4 @@ async def download_media(client, message, msg_id, progress=None):
     except Exception as e:
         return f"Error downloading media: {str(e)}"
         
-# members command
-@Client.on_message(filters.command(["members"]))
-async def channel_members_command(client: Client, message: Message):
-    """Get detailed information about channel members"""
-    # Check if chat ID or username is provided
-    if len(message.text.split()) < 2:
-        await client.send_message(message.chat.id, "Please provide a channel/group ID or username", reply_to_message_id=message.id)
-        return
-    
-    # Get the chat ID or username
-    chat_id = message.text.split(None, 1)[1].strip()
-    
-    # Get user session string
-    user_data = database.find_one({'chat_id': message.chat.id})
-    
-    # Check if user is logged in
-    if user_data is None or not user_data.get('logged_in', False) or not user_data.get('session'):
-        await client.send_message(message.chat.id, strings['need_login'], reply_to_message_id=message.id)
-        return
-        
-    session_string = user_data.get('session')
-    
-    # Create user client
-    acc, err = await create_client_session(session_string, f"members_{message.chat.id}")
-    if err:
-        await client.send_message(message.chat.id, f"Failed to login: {err}", reply_to_message_id=message.id)
-        return
-        
-    try:
-        # Send "checking" message
-        members_msg = await message.reply("Fetching channel member information...")
-        
-        # Get member info
-        members = await get_channel_members_info(acc, chat_id, limit=50)  # Limit to 50 to avoid processing too much data
-        
-        if isinstance(members, dict) and "error" in members:
-            await members_msg.edit_text(f"Error fetching member info: {members['error']}")
-            return
-            
-        if not members or len(members) == 0:
-            await members_msg.edit_text("No members found or you don't have access to view members.")
-            return
-            
-        # Calculate statistics
-        total_members = len(members)
-        online_count = len([m for m in members if m.get('status') == 'online'])
-        
-        # Count member roles
-        admins = len([m for m in members if m.get('role') == 'admin'])
-        creators = len([m for m in members if m.get('role') == 'creator'])
-        regular_members = len([m for m in members if m.get('role') == 'member'])
-        
-        # Format member statistics
-        stats_text = "**Channel Member Statistics**\n\n"
-        stats_text += f"**Total Members (sampled):** {total_members}\n"
-        stats_text += f"**Currently Online:** {online_count}\n"
-        stats_text += f"**Admins:** {admins}\n"
-        stats_text += f"**Creators:** {creators}\n"
-        stats_text += f"**Regular Members:** {regular_members}\n\n"
-        
-        # List online members
-        if online_count > 0:
-            stats_text += "**Online Members:**\n"
-            online_members = [m for m in members if m.get('status') == 'online']
-            for member in online_members[:10]:  # Limit to 10 to keep message size reasonable
-                name = f"{member.get('first_name') or ''} {member.get('last_name') or ''}".strip()
-                username = f" (@{member['username']})" if member.get('username') else ""
-                stats_text += f"- {name}{username}\n"
-                
-            if online_count > 10:
-                stats_text += f"...and {online_count - 10} more\n"
-        
-        # List admins
-        if admins > 0:
-            stats_text += "\n**Admins:**\n"
-            admin_members = [m for m in members if m.get('role') == 'admin']
-            for member in admin_members[:10]:  # Limit to 10
-                name = f"{member.get('first_name') or ''} {member.get('last_name') or ''}".strip()
-                username = f" (@{member['username']})" if member.get('username') else ""
-                stats_text += f"- {name}{username}\n"
-                
-                # If admin has permissions, show them
-                if member.get('permissions'):
-                    perm_text = ", ".join([perm for perm, value in member['permissions'].items() if value])
-                    if perm_text:
-                        stats_text += f"  Permissions: {perm_text}\n"
-                        
-            if admins > 10:
-                stats_text += f"...and {admins - 10} more\n"
-                
-        # Update the message with the stats
-        await members_msg.edit_text(stats_text, parse_mode=ParseMode.MARKDOWN)
-        
-    except Exception as e:
-        await message.reply(f"Error: {str(e)}")
-    finally:
-        # Always disconnect the client when done
-        await safe_disconnect(acc)
         

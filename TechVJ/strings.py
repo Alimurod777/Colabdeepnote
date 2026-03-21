@@ -54,47 +54,6 @@ __get detailed information about a chat with the /chatinfo command followed by c
 /chatinfo -1001234567890
 ```
 
-**__MESSAGE STATISTICS__**
-
-__view detailed statistics about a message with the /msgstats command__
-
-```
-/msgstats 123456  # Get stats for message ID in current chat
-/msgstats         # Reply to a message to get its stats
-/msgstats 123456 @channel_name  # Get stats for message ID in specific chat
-```
-
-**__CHANNEL MEMBERS__**
-
-__view information about members in a channel with the /members command__
-
-```
-/members @channel_name
-/members -1001234567890
-```
-
-**__CODE GENERATION__**
-
-__generate sample code in different programming languages with the /gencode or /generate command__
-
-```
-/gencode python   # Generate Python code
-/gencode javascript   # Generate JavaScript code
-/gencode java   # Generate Java code
-/gencode cpp   # Generate C++ code
-/gencode html   # Generate HTML code
-```
-
-__or simply use /gencode to see all available options__
-
-**__CUSTOM CODE__**
-
-__format and send your own code with syntax highlighting using the /customcode command__
-
-```
-/customcode python   # Reply to a message containing Python code
-```
-
 **__POLL SUPPORT__**
 
 __the bot now supports forwarding polls and quizzes, preserving all options and correct answers__
