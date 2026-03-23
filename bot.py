@@ -18,6 +18,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Global unhandled exception handler ──
+def global_exception_handler(loop, context):
+    """asyncio event loop uchun global exception handler.
+    Hech qanday unhandled exception bot'ni to'xtatmasin."""
+    exception = context.get("exception")
+    message = context.get("message", "No message")
+
+    if exception:
+        # Bu xatolarni jimgina o'tkazib yuboramiz (normal)
+        if isinstance(exception, (ConnectionResetError, OSError, TimeoutError)):
+            logger.warning(f"Network exception (handled): {type(exception).__name__}: {exception}")
+            return
+        # RuntimeError: transport closed — bu ham normal
+        if isinstance(exception, RuntimeError) and "closed" in str(exception).lower():
+            logger.warning(f"Transport closed exception (handled): {exception}")
+            return
+        logger.error(f"Unhandled async exception: {type(exception).__name__}: {exception}\nContext: {message}")
+    else:
+        logger.error(f"Unhandled async error: {message}")
+
+
+def setup_global_handlers():
+    """Barcha turdagi exception handler'larni o'rnatadi."""
+    # 1) asyncio loop uchun
+    try:
+        loop = asyncio.get_event_loop()
+        loop.set_exception_handler(global_exception_handler)
+    except RuntimeError:
+        pass  # No loop yet
+
+    # 2) threading uchun (pyrogram ichki threadlari)
+    import threading
+    _original_excepthook = threading.excepthook
+    def thread_exception_handler(args):
+        logger.error(
+            f"Unhandled thread exception in {args.thread}: "
+            f"{args.exc_type.__name__}: {args.exc_value}"
+        )
+        # Tizim kritik xatolarni o'tkazamiz
+        if args.exc_type in (SystemExit, KeyboardInterrupt):
+            if _original_excepthook:
+                _original_excepthook(args)
+    threading.excepthook = thread_exception_handler
+
+    # 3) sys.excepthook — hech bo'lmaganda log qilamiz
+    _original_sys_excepthook = sys.excepthook
+    def sys_exception_handler(exc_type, exc_value, exc_tb):
+        if exc_type in (SystemExit, KeyboardInterrupt):
+            _original_sys_excepthook(exc_type, exc_value, exc_tb)
+            return
+        logger.error(f"Unhandled sys exception: {exc_type.__name__}: {exc_value}", exc_info=(exc_type, exc_value, exc_tb))
+    sys.excepthook = sys_exception_handler
+
 # Connection parameters
 MAX_RETRIES = 10
 INITIAL_RETRY_DELAY = 1
@@ -142,7 +195,12 @@ async def main():
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
-    
+
+    # Set up global exception handlers
+    setup_global_handlers()
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(global_exception_handler)
+
     runner = BotRunner()
     try:
         await runner.start_bot()
@@ -158,6 +216,8 @@ if __name__ == "__main__":
         # Always use a new event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        loop.set_exception_handler(global_exception_handler)
+        setup_global_handlers()
         
         # Log event loop implementation
         loop_class = loop.__class__.__name__

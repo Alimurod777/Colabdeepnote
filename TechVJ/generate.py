@@ -7,6 +7,7 @@ import asyncio
 import os
 import io
 import glob
+import logging
 import qrcode
 from pyrogram.types import Message
 from pyrogram import Client, filters
@@ -23,6 +24,8 @@ from pyrogram.errors import (
 from TechVJ.strings import strings
 from config import API_ID, API_HASH
 from database.db import database
+
+logger = logging.getLogger(__name__)
 
 SESSION_STRING_SIZE = 351
 
@@ -53,26 +56,57 @@ async def main(bot: Client, message: Message):
         await message.reply(strings['already_logged_in'])
         return 
     user_id = int(message.from_user.id)
-    phone_number_msg = await bot.ask(chat_id=user_id, text="<b>Please send your phone number which includes country code</b>\n<b>Example:</b> <code>+13124562345, +9171828181889</code>")
-    if phone_number_msg.text=='/cancel':
+    try:
+        phone_number_msg = await bot.ask(
+            chat_id=user_id,
+            text="<b>Please send your phone number which includes country code</b>\n<b>Example:</b> <code>+13124562345, +9171828181889</code>",
+            filters=filters.text,
+            timeout=300,
+        )
+    except TimeoutError:
+        logger.warning(f"User {user_id}: phone number input timeout")
+        await bot.send_message(user_id, "⏰ **Vaqt tugadi.** Telefon raqam kiritilmadi.\nQayta boshlash uchun /login yuboring.")
+        return
+    except Exception as e:
+        logger.error(f"User {user_id}: phone ask error: {e}")
+        await bot.send_message(user_id, f"**Xatolik yuz berdi:** `{e}`\nQayta urinib ko'ring: /login")
+        return
+
+    if phone_number_msg.text == '/cancel':
         return await phone_number_msg.reply('<b>process cancelled !</b>')
     phone_number = phone_number_msg.text
-    
+
     # Create sessions directory if it doesn't exist
     os.makedirs("sessions", exist_ok=True)
     session_path = f"sessions/temp_user_{user_id}"
-    
+
     client = Client(session_path, API_ID, API_HASH)
     try:
         await client.connect()
         await phone_number_msg.reply("Sending OTP...")
         try:
             code = await client.send_code(phone_number)
-            phone_code_msg = await bot.ask(user_id, "Please check for an OTP in official telegram account. If you got it, send OTP here after reading the below format. \n\nIf OTP is `12345`, **please send it as** `1 2 3 4 5`.\n\n**Enter /cancel to cancel The Procces**", filters=filters.text, timeout=600)
         except PhoneNumberInvalid:
             await phone_number_msg.reply('`PHONE_NUMBER` **is invalid.**')
             return
-        if phone_code_msg.text=='/cancel':
+
+        try:
+            phone_code_msg = await bot.ask(
+                user_id,
+                "Please check for an OTP in official telegram account. If you got it, send OTP here after reading the below format. \n\nIf OTP is `12345`, **please send it as** `1 2 3 4 5`.\n\n**Enter /cancel to cancel The Procces**",
+                filters=filters.text,
+                timeout=600,
+            )
+        except TimeoutError:
+            logger.warning(f"User {user_id}: OTP input timeout (600s)")
+            await bot.send_message(user_id, "⏰ **OTP kiritish vaqti tugadi (10 daqiqa).**\nQayta boshlash uchun /login yuboring.")
+            return
+        except Exception as e:
+            logger.error(f"User {user_id}: OTP ask error: {e}")
+            await bot.send_message(user_id, f"**Xatolik yuz berdi:** `{e}`\nQayta urinib ko'ring: /login")
+            return
+
+        if phone_code_msg.text == '/cancel':
             return await phone_code_msg.reply('<b>process cancelled !</b>')
         try:
             phone_code = phone_code_msg.text.replace(" ", "")
@@ -84,8 +118,23 @@ async def main(bot: Client, message: Message):
             await phone_code_msg.reply('**OTP is expired.**')
             return
         except SessionPasswordNeeded:
-            two_step_msg = await bot.ask(user_id, '**Your account has enabled two-step verification. Please provide the password.\n\nEnter /cancel to cancel The Procces**', filters=filters.text, timeout=300)
-            if two_step_msg.text=='/cancel':
+            try:
+                two_step_msg = await bot.ask(
+                    user_id,
+                    '**Your account has enabled two-step verification. Please provide the password.\n\nEnter /cancel to cancel The Procces**',
+                    filters=filters.text,
+                    timeout=300,
+                )
+            except TimeoutError:
+                logger.warning(f"User {user_id}: 2FA password input timeout")
+                await bot.send_message(user_id, "⏰ **2FA parol kiritish vaqti tugadi.**\nQayta boshlash uchun /login yuboring.")
+                return
+            except Exception as e:
+                logger.error(f"User {user_id}: 2FA ask error: {e}")
+                await bot.send_message(user_id, f"**Xatolik yuz berdi:** `{e}`\nQayta urinib ko'ring: /login")
+                return
+
+            if two_step_msg.text == '/cancel':
                 return await two_step_msg.reply('<b>process cancelled !</b>')
             try:
                 password = two_step_msg.text
@@ -207,12 +256,22 @@ async def qr_login(bot: Client, message: Message):
 
     except SessionPasswordNeeded:
         try:
-            pwd_msg = await bot.ask(
-                user_id,
-                "**2FA parol kerak. Iltimos parolni kiriting:**\n\n/cancel — bekor qilish",
-                filters=filters.text,
-                timeout=300
-            )
+            try:
+                pwd_msg = await bot.ask(
+                    user_id,
+                    "**2FA parol kerak. Iltimos parolni kiriting:**\n\n/cancel — bekor qilish",
+                    filters=filters.text,
+                    timeout=300
+                )
+            except TimeoutError:
+                logger.warning(f"User {user_id}: QR 2FA password input timeout")
+                await bot.send_message(user_id, "⏰ **2FA parol kiritish vaqti tugadi.**\nQayta boshlash uchun /qrlogin yuboring.")
+                return
+            except Exception as e:
+                logger.error(f"User {user_id}: QR 2FA ask error: {e}")
+                await bot.send_message(user_id, f"**Xatolik yuz berdi:** `{e}`")
+                return
+
             if pwd_msg.text == "/cancel":
                 await pwd_msg.reply("**Bekor qilindi.**")
                 return

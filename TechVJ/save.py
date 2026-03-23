@@ -6,7 +6,7 @@ import asyncio
 import pyrogram
 import logging
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated, UserAlreadyParticipant, InviteHashExpired, UsernameNotOccupied
+from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated, UserAlreadyParticipant, InviteHashExpired, UsernameNotOccupied, ChannelInvalid, ChannelPrivate
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message 
 from pyrogram.enums import ChatType, ParseMode, UserStatus, PollType, MessageMediaType, MessageEntityType, SentCodeType, NextCodeType
 from pyrogram.raw import functions, types
@@ -323,6 +323,7 @@ async def upload_via_user_session(
             in_memory=True,
             no_updates=True,
             sleep_threshold=60,
+            max_concurrent_transmissions=1,
         )
 
     success = True
@@ -389,11 +390,28 @@ async def upload_via_user_session(
                 if progress_msg:
                     write_progress(f"{progress_msg.id}_up", current, total)
 
-            for attempt in range(5):
+            # Exponential backoff: 10s, 20s, 40s, 60s, 120s
+            RETRY_DELAYS = [10, 20, 40, 60, 120]
+            MAX_UPLOAD_RETRIES = len(RETRY_DELAYS)
+
+            for attempt in range(MAX_UPLOAD_RETRIES):
                 try:
                     # Flood wait tekshiruvi
                     await flood_controller.wait_if_needed(user_id)
-                    
+
+                    # Upload orasida connection tekshiruvi
+                    if not uclient.is_connected:
+                        logger.warning(f"User {user_id}: uclient disconnected before upload attempt {attempt+1}, reconnecting...")
+                        try:
+                            await uclient.connect()
+                            uclient.me = await uclient.get_me()
+                        except Exception as rc_err:
+                            logger.error(f"User {user_id}: reconnect failed: {rc_err}")
+                            if attempt < MAX_UPLOAD_RETRIES - 1:
+                                await asyncio.sleep(RETRY_DELAYS[attempt])
+                                continue
+                            raise
+
                     if msg_type == "Video":
                         await uclient.send_video(
                             chat_id=chat_id, video=part_path,
@@ -456,7 +474,7 @@ async def upload_via_user_session(
                     wait = e.value
                     # Flood controller'ga xabar berish
                     await flood_controller.handle_flood_wait(user_id, wait)
-                    
+
                     if progress_msg:
                         try:
                             if total_parts > 1:
@@ -470,8 +488,79 @@ async def upload_via_user_session(
                         except Exception:
                             pass
                     await asyncio.sleep(wait)
+                except (ConnectionError, OSError, TimeoutError) as send_err:
+                    # TCP/Network xatolar — exponential backoff bilan retry
+                    delay = RETRY_DELAYS[attempt]
+                    logger.warning(
+                        f"User {user_id}: Upload attempt {attempt+1}/{MAX_UPLOAD_RETRIES} failed: "
+                        f"{type(send_err).__name__}: {send_err}. Retrying in {delay}s..."
+                    )
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit(
+                                f"⚠️ **Upload xatosi** (urinish {attempt+1}/{MAX_UPLOAD_RETRIES}): "
+                                f"`{type(send_err).__name__}`\n"
+                                f"⏳ {delay}s dan keyin qayta uriniladi..."
+                            )
+                        except Exception:
+                            pass
+
+                    if attempt < MAX_UPLOAD_RETRIES - 1:
+                        await asyncio.sleep(delay)
+                        # Reconnect attempt
+                        try:
+                            if not uclient.is_connected:
+                                await uclient.connect()
+                                uclient.me = await uclient.get_me()
+                                logger.info(f"User {user_id}: reconnected after upload error")
+                        except Exception as rc_err:
+                            logger.error(f"User {user_id}: reconnect after upload error failed: {rc_err}")
+                        continue
+                    # Max urinishlar tugadi
+                    logger.error(f"User {user_id}: Upload failed after {MAX_UPLOAD_RETRIES} attempts")
+                    await safe_send_message(
+                        bot, user_id,
+                        f"❌ **Upload muvaffaqiyatsiz** ({MAX_UPLOAD_RETRIES} urinishdan keyin).\n"
+                        f"Xato: `{type(send_err).__name__}: {send_err}`"
+                    )
+                    raise
+                except RuntimeError as send_err:
+                    # "unable to perform operation on <TCPTransport closed=True>"
+                    error_str = str(send_err).lower()
+                    if "closed" in error_str or "transport" in error_str:
+                        delay = RETRY_DELAYS[attempt]
+                        logger.warning(
+                            f"User {user_id}: TCPTransport closed, attempt {attempt+1}/{MAX_UPLOAD_RETRIES}. "
+                            f"Retrying in {delay}s..."
+                        )
+                        if progress_msg:
+                            try:
+                                await progress_msg.edit(
+                                    f"⚠️ **Ulanish uzildi** (urinish {attempt+1}/{MAX_UPLOAD_RETRIES})\n"
+                                    f"⏳ {delay}s dan keyin qayta ulaniladi..."
+                                )
+                            except Exception:
+                                pass
+                        if attempt < MAX_UPLOAD_RETRIES - 1:
+                            await asyncio.sleep(delay)
+                            try:
+                                await uclient.connect()
+                                uclient.me = await uclient.get_me()
+                                logger.info(f"User {user_id}: reconnected after TCPTransport close")
+                            except Exception as rc_err:
+                                logger.error(f"User {user_id}: reconnect failed: {rc_err}")
+                            continue
+                        logger.error(f"User {user_id}: Upload failed — TCPTransport repeatedly closed")
+                        await safe_send_message(
+                            bot, user_id,
+                            f"❌ **Upload muvaffaqiyatsiz** — ulanish barqaror emas.\n"
+                            f"Iltimos biroz kutib qayta urinib ko'ring."
+                        )
+                        raise
+                    else:
+                        raise
                 except Exception as send_err:
-                    print(f"[UPLOAD] xato attempt={attempt}: {type(send_err).__name__}: {send_err}")
+                    logger.error(f"[UPLOAD] unexpected error attempt={attempt}: {type(send_err).__name__}: {send_err}")
                     import traceback
                     traceback.print_exc()
                     raise
@@ -500,7 +589,7 @@ async def upload_via_user_session(
                     return False, None
                 # Minimal delay between parts to prevent flood
                 if idx < len(parts_list) - 1:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
             return True, None
 
         # ── Primary upload ──
@@ -898,40 +987,113 @@ async def get_user_status_info(client, user_id):
 async def ensure_connected(client):
     """acc (user session) transport yopilgan bo'lsa qayta ulanadi.
     Agar ulanish imkoni bo'lmasa False qaytaradi."""
-    try:
-        # 1) Pyrofork `is_connected` flagi (connect/disconnect da o'zgaradi)
-        if client.is_connected is False or client.is_connected is None:
-            logger.warning("User session disconnected (is_connected=False) — reconnecting...")
-            await client.connect()
-            if not getattr(client, 'me', None):
-                client.me = await client.get_me()
-            logger.info("User session reconnected successfully")
-            return True
+    MAX_RECONNECT_ATTEMPTS = 3
 
-        # 2) Transport yopilgan bo'lishi mumkin (TCPTransport closed=True)
-        #    is_connected hali True bo'lib qolgan, lekin session.connection yopilgan
-        session = getattr(client, 'session', None)
-        if session:
-            conn = getattr(session, 'connection', None)
-            if conn:
-                transport = getattr(conn, 'transport', None)
-                if transport and getattr(transport, '_closed', False):
-                    logger.warning("User session transport closed — reconnecting...")
-                    # Avval eski sessionni to'xtatamiz
+    for reconnect_attempt in range(MAX_RECONNECT_ATTEMPTS):
+        try:
+            # 1) Pyrofork `is_connected` flagi (connect/disconnect da o'zgaradi)
+            if client.is_connected is False or client.is_connected is None:
+                logger.warning(f"User session disconnected (is_connected=False) — reconnecting (attempt {reconnect_attempt+1})...")
+                await client.connect()
+                if not getattr(client, 'me', None):
+                    client.me = await client.get_me()
+                logger.info("User session reconnected successfully")
+                return True
+
+            # 2) Transport yopilgan bo'lishi mumkin (TCPTransport closed=True)
+            #    is_connected hali True bo'lib qolgan, lekin session.connection yopilgan
+            session = getattr(client, 'session', None)
+            if session:
+                conn = getattr(session, 'connection', None)
+                if conn:
+                    transport = getattr(conn, 'transport', None)
+                    if transport and getattr(transport, '_closed', False):
+                        logger.warning(f"User session transport closed — reconnecting (attempt {reconnect_attempt+1})...")
+                        # Avval eski sessionni to'xtatamiz
+                        try:
+                            client.is_connected = False
+                            await session.stop()
+                        except Exception:
+                            pass
+                        await client.connect()
+                        if not getattr(client, 'me', None):
+                            client.me = await client.get_me()
+                        logger.info("User session reconnected after transport close")
+                        return True
+
+            # 3) Ping-test: get_me() bilan haqiqiy ulanishni tekshirish
+            try:
+                await client.get_me()
+            except Exception as ping_err:
+                error_str = str(ping_err).lower()
+                if any(kw in error_str for kw in ["closed", "transport", "timeout", "connection", "reset"]):
+                    logger.warning(f"Ping test failed: {ping_err} — reconnecting (attempt {reconnect_attempt+1})...")
                     try:
                         client.is_connected = False
-                        await session.stop()
+                        await client.disconnect()
                     except Exception:
                         pass
+                    await asyncio.sleep(2 * (reconnect_attempt + 1))
                     await client.connect()
                     if not getattr(client, 'me', None):
                         client.me = await client.get_me()
-                    logger.info("User session reconnected after transport close")
+                    logger.info("User session reconnected after ping failure")
                     return True
+                else:
+                    # get_me boshqa xato (masalan FloodWait) — ulanish bor deb hisoblaymiz
+                    pass
 
+            return True
+        except Exception as e:
+            logger.error(f"Reconnect attempt {reconnect_attempt+1} failed: {type(e).__name__}: {e}")
+            if reconnect_attempt < MAX_RECONNECT_ATTEMPTS - 1:
+                await asyncio.sleep(3 * (reconnect_attempt + 1))
+                continue
+            return False
+
+    return False
+
+
+async def resolve_channel_peer(client, chat_id):
+    """Kanalning peer'ini resolve qiladi — CHANNEL_INVALID oldini olish uchun.
+    chat_id: int (-100...) yoki str (username).
+    Muvaffaqiyatli bo'lsa True, aks holda False qaytaradi.
+    """
+    try:
+        # Avval oddiy resolve_peer bilan urinib ko'ramiz
+        await client.resolve_peer(chat_id)
+        return True
+    except (ChannelInvalid, ChannelPrivate):
+        pass
+    except Exception:
+        pass
+
+    # Raw API orqali kanal ID ni resolve qilish
+    try:
+        if isinstance(chat_id, int) and str(chat_id).startswith("-100"):
+            # -100 prefiksini olib, raw channel_id olish
+            raw_channel_id = int(str(chat_id)[4:])
+            input_channel = types.InputChannel(
+                channel_id=raw_channel_id,
+                access_hash=0
+            )
+            result = await client.invoke(
+                functions.channels.GetChannels(
+                    id=[input_channel]
+                )
+            )
+            if result and hasattr(result, 'chats') and result.chats:
+                logger.info(f"Channel {chat_id} resolved via Raw API")
+                return True
+    except Exception as raw_err:
+        logger.debug(f"Raw API channel resolve failed: {raw_err}")
+
+    # get_chat bilan urinib ko'ramiz
+    try:
+        await client.get_chat(chat_id)
         return True
     except Exception as e:
-        logger.error(f"Reconnect failed: {type(e).__name__}: {e}")
+        logger.warning(f"Could not resolve channel {chat_id}: {e}")
         return False
 
 
@@ -947,10 +1109,17 @@ async def create_client_session(session_string, client_name="saverestricted"):
                 no_updates=True,
                 in_memory=True,
                 sleep_threshold=60,
+                max_concurrent_transmissions=1,
                 device_model="Telegram Desktop",
                 system_version="Windows 10"
             )
             await client.connect()
+            # me ni darhol to'ldirish — keyinchalik is_premium va boshqa tekshiruvlar uchun
+            try:
+                client.me = await client.get_me()
+            except Exception:
+                pass
+            logger.info(f"Client session '{client_name}' connected (attempt {attempt+1})")
             return client, None
         except Exception as e:
             if client:
@@ -958,16 +1127,22 @@ async def create_client_session(session_string, client_name="saverestricted"):
                     await client.disconnect()
                 except:
                     pass
-            
+
             error_str = str(e).lower()
+            # Auth xatolari — retry qilmaslik kerak
+            if "auth_key" in error_str or "unregistered" in error_str:
+                return None, f"Session yaroqsiz: {e}"
+
             # For connection errors, retry with backoff
-            if "connection" in error_str or "network" in error_str or "timeout" in error_str:
+            if any(kw in error_str for kw in ["connection", "network", "timeout", "reset", "closed", "transport"]):
                 if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                    delay = RETRY_DELAY * (2 ** attempt)  # exponential backoff
+                    logger.warning(f"Client '{client_name}' connection failed (attempt {attempt+1}): {e}. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
                     continue
-            
+
             return None, f"Failed to establish connection: {str(e)}"
-    
+
     return None, "Connection failed after multiple attempts"
 
 # Helper function to safely disconnect client
@@ -1370,6 +1545,21 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
             return
 
         try:
+            # ── CHANNEL_INVALID oldini olish: peer'ni resolve qilish ──
+            if not await resolve_channel_peer(acc, chatid):
+                txt = (
+                    "❌ **Kanalga ulanib bo'lmadi.**\n\n"
+                    "Sabablari:\n"
+                    "• Siz bu kanalga a'zo emassiz\n"
+                    "• Kanal o'chirilgan yoki mavjud emas\n"
+                    "• Session eskirgan — /logout va /login qayta qiling"
+                )
+                if status_msg:
+                    await client.edit_message_text(message.chat.id, status_msg.id, txt)
+                else:
+                    await client.send_message(message.chat.id, txt, reply_to_message_id=message.id)
+                return
+
             for msgid in range(fromID, toID + 1):
                 try:
                     if not await ensure_connected(acc):
@@ -1950,16 +2140,50 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
                 reply_to_message_id=message.id
             )
             return _EMPTY
+        except (ChannelInvalid, ChannelPrivate) as ch_err:
+            # Kanal topilmadi yoki ruxsat yo'q
+            logger.warning(f"Channel error for chatid={chatid}, msgid={msgid}: {ch_err}")
+            # Peer'ni resolve qilib qayta urinish
+            if attempt < MAX_RETRIES - 1:
+                resolved = await resolve_channel_peer(acc, chatid)
+                if resolved:
+                    logger.info(f"Channel {chatid} resolved, retrying...")
+                    await asyncio.sleep(1)
+                    continue
+            await safe_send_message(
+                client, message.chat.id,
+                f"❌ **Kanal xatosi:** `{ch_err}`\n\n"
+                f"Bu kanal mavjud emas yoki siz a'zo emassiz.\n"
+                f"Iltimos /logout va /login qayta qiling.",
+                reply_to_message_id=message.id
+            )
+            return _EMPTY
         except Exception as e:
             error_str = str(e).lower()
             # Completely suppress these specific errors
             if "downloadable media" in error_str or "message_empty" in error_str or "400 message" in error_str:
                 return _EMPTY  # Silently ignore
-            
-            # For network errors, retry
-            if "connection" in error_str or "network" in error_str or "timeout" in error_str:
+
+            # CHANNEL_INVALID string bilan ham tekshirish
+            if "channel_invalid" in error_str or "channel_private" in error_str:
                 if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))  # Exponential backoff
+                    resolved = await resolve_channel_peer(acc, chatid)
+                    if resolved:
+                        logger.info(f"Channel {chatid} resolved via string check, retrying...")
+                        await asyncio.sleep(1)
+                        continue
+                await safe_send_message(
+                    client, message.chat.id,
+                    f"❌ **Kanal xatosi:** Kanalga kirish imkoni yo'q.\n"
+                    f"Iltimos /logout va /login qayta qiling.",
+                    reply_to_message_id=message.id
+                )
+                return _EMPTY
+
+            # For network errors, retry
+            if any(kw in error_str for kw in ["connection", "network", "timeout", "reset", "closed", "transport"]):
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
                     continue
             
             # For other errors, we'll still show them - except specific ones we want to handle
