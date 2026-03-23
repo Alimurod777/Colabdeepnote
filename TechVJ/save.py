@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 _bot_id_cache = None
 _bot_username_cache = None
 
+# TUZATISH: CHANNEL_INVALID — modul darajasida peer keshi
+# {chat_id: True} — muvaffaqiyatli resolve qilingan peer'lar
+# Bot restart bo'lganda kesh tozalanadi (bu normal — peer qayta resolve qilinadi)
+_resolved_peers_cache: dict = {}
+
 
 async def _get_bot_id(client):
     """Bot ID va username ni bir marta olib keshlaydi."""
@@ -42,6 +47,92 @@ async def _get_bot_id(client):
         _bot_id_cache = me.id
         _bot_username_cache = me.username
     return _bot_id_cache
+
+
+async def _resolve_bot_peer(uclient, chat_id):
+    """TUZATISH: PEER_ID_INVALID — user session orqali bot peer'ini resolve qiladi.
+
+    Kesh-aware, FloodWait-safe.
+    Tartib:
+      1) Kesh tekshiruvi
+      2) resolve_peer(@bot_username) — username bilan
+      3) get_users(bot_username)
+      4) resolve_peer(chat_id) — numeric ID
+      5) get_chat(bot_id)
+      6) get_users(chat_id) — numeric ID
+    """
+    global _resolved_peers_cache
+
+    # Kesh tekshiruvi
+    bot_cache_key = f"bot_{chat_id}"
+    if bot_cache_key in _resolved_peers_cache:
+        try:
+            await uclient.resolve_peer(chat_id)
+            return True
+        except Exception:
+            _resolved_peers_cache.pop(bot_cache_key, None)
+
+    # 1) Username orqali resolve_peer — eng ishonchli
+    if _bot_username_cache:
+        try:
+            await uclient.resolve_peer(f"@{_bot_username_cache}")
+            _resolved_peers_cache[bot_cache_key] = True
+            logger.debug(f"Bot peer resolved via resolve_peer(@{_bot_username_cache})")
+            return True
+        except FloodWait as fw:
+            await asyncio.sleep(fw.value)
+        except Exception:
+            pass
+
+    # 2) get_users(username) — username orqali
+    if _bot_username_cache:
+        try:
+            await uclient.get_users(_bot_username_cache)
+            _resolved_peers_cache[bot_cache_key] = True
+            logger.debug(f"Bot peer resolved via get_users(@{_bot_username_cache})")
+            return True
+        except FloodWait as fw:
+            await asyncio.sleep(fw.value)
+        except Exception:
+            pass
+
+    # 3) resolve_peer(chat_id) — numeric ID bilan
+    try:
+        await uclient.resolve_peer(chat_id)
+        _resolved_peers_cache[bot_cache_key] = True
+        logger.debug(f"Bot peer resolved via resolve_peer({chat_id})")
+        return True
+    except FloodWait as fw:
+        await asyncio.sleep(fw.value)
+    except Exception:
+        pass
+
+    # 4) get_chat(bot_id)
+    if _bot_id_cache:
+        try:
+            await uclient.get_chat(_bot_id_cache)
+            _resolved_peers_cache[bot_cache_key] = True
+            logger.debug(f"Bot peer resolved via get_chat({_bot_id_cache})")
+            return True
+        except FloodWait as fw:
+            await asyncio.sleep(fw.value)
+        except Exception:
+            pass
+
+    # 5) get_users(chat_id) — numeric ID
+    try:
+        await uclient.get_users(chat_id)
+        _resolved_peers_cache[bot_cache_key] = True
+        logger.debug(f"Bot peer resolved via get_users({chat_id})")
+        return True
+    except FloodWait as fw:
+        await asyncio.sleep(fw.value)
+    except Exception:
+        pass
+
+    logger.warning(f"Could not resolve bot peer (chat_id={chat_id}, bot=@{_bot_username_cache}). "
+                   f"User may need to /start the bot first.")
+    return False
 
 
 STATIC_FFMPEG_PATH = os.path.join(os.path.dirname(__file__), "..", "staticfiles", "ffmpeg")
@@ -294,7 +385,19 @@ async def upload_via_user_session(
         if not os.path.exists(file_path):
             await safe_send_message(bot, user_id, f"**Upload xatosi:** fayl topilmadi: `{file_path}`")
             return False
-    # io.BytesIO uchun tekshiruv yo'q
+        # TUZATISH: DOCUMENT_INVALID — bo'sh fayl yuborilsa 400 xato chiqadi
+        if os.path.getsize(file_path) == 0:
+            logger.warning(f"User {user_id}: upload skipped — file is empty: {file_path}")
+            await safe_send_message(bot, user_id, "**Upload xatosi:** fayl bo'sh (0 bayt).")
+            return False
+    # io.BytesIO uchun tekshiruv
+    elif isinstance(file_path, io.BytesIO):
+        # TUZATISH: DOCUMENT_INVALID — bo'sh BytesIO yuborilsa 400 xato chiqadi
+        if file_path.getbuffer().nbytes == 0:
+            logger.warning(f"User {user_id}: upload skipped — BytesIO is empty")
+            await safe_send_message(bot, user_id, "**Upload xatosi:** fayl bo'sh (0 bayt).")
+            return False
+        file_path.seek(0)  # Pozitsiyani boshiga qaytarish
 
     # Target chat: bot bilan private chat yoki fallback user_id
     chat_id = target_chat or user_id
@@ -334,14 +437,9 @@ async def upload_via_user_session(
                 await uclient.connect()
                 # self.me ni to'ldirish — save_file.py ichida is_premium tekshiriladi
                 uclient.me = await uclient.get_me()
-                # Bot peer'ini uclient cache ga yuklash — PEER_ID_INVALID oldini olish.
-                try:
-                    if _bot_username_cache:
-                        await uclient.get_users(_bot_username_cache)
-                    else:
-                        await uclient.get_users(chat_id)
-                except Exception:
-                    pass
+                # TUZATISH: PEER_ID_INVALID — bot peer'ini uclient keshiga yuklash
+                # Bir necha usulda urinib ko'ramiz
+                await _resolve_bot_peer(uclient, chat_id)
             else:
                 # existing_client da me bo'lmasa to'ldiramiz
                 # Avval ulanishni tekshiramiz
@@ -350,14 +448,8 @@ async def upload_via_user_session(
                     await uclient.connect()
                 if not getattr(uclient, 'me', None):
                     uclient.me = await uclient.get_me()
-                    # Bot peer'ini resolve — faqat me yangi olinganda (ya'ni birinchi marta)
-                    try:
-                        if _bot_username_cache:
-                            await uclient.get_users(_bot_username_cache)
-                        else:
-                            await uclient.get_users(chat_id)
-                    except Exception:
-                        pass
+                    # TUZATISH: PEER_ID_INVALID — bot peer resolve faqat me yangi olinganda
+                    await _resolve_bot_peer(uclient, chat_id)
             # ── Premium check → split qaror ──
             is_premium = getattr(uclient.me, 'is_premium', False)
             # BytesIO uchun getsize ishlamaydi — tashqaridan kelgan file_size ishlatiladi
@@ -463,10 +555,11 @@ async def upload_via_user_session(
                             progress=_up_progress,
                         )
                     else:
+                        # TUZATISH: DOCUMENT_INVALID — force_document=True bo'lishi kerak
                         await uclient.send_document(
                             chat_id=chat_id, document=part_path,
                             caption=part_caption, thumb=thumb,
-                            force_document=False,
+                            force_document=True,
                             progress=_up_progress,
                         )
                     return True
@@ -560,6 +653,30 @@ async def upload_via_user_session(
                     else:
                         raise
                 except Exception as send_err:
+                    err_str = str(send_err).lower()
+                    # TUZATISH: PEER_ID_INVALID — bot peer keshdan tushib ketgan
+                    if "peer_id_invalid" in err_str or "peer id" in err_str:
+                        logger.warning(f"User {user_id}: PEER_ID_INVALID — re-resolving bot peer (attempt {attempt+1})")
+                        if attempt < MAX_UPLOAD_RETRIES - 1:
+                            # Bot peer'ni qayta resolve qilish
+                            await _resolve_bot_peer(uclient, chat_id)
+                            await asyncio.sleep(RETRY_DELAYS[attempt])
+                            continue
+                        await safe_send_message(
+                            bot, user_id,
+                            "❌ **Upload xatosi:** Bot peer topilmadi.\n"
+                            "Iltimos botga /start yuboring va qayta urinib ko'ring."
+                        )
+                        raise
+                    # TUZATISH: DOCUMENT_INVALID — fayl noto'g'ri
+                    if "document_invalid" in err_str:
+                        logger.error(f"User {user_id}: DOCUMENT_INVALID for {msg_type}")
+                        await safe_send_message(
+                            bot, user_id,
+                            f"❌ **Upload xatosi:** Fayl noto'g'ri formatda (`DOCUMENT_INVALID`).\n"
+                            f"Fayl buzilgan yoki bo'sh bo'lishi mumkin."
+                        )
+                        raise
                     logger.error(f"[UPLOAD] unexpected error attempt={attempt}: {type(send_err).__name__}: {send_err}")
                     import traceback
                     traceback.print_exc()
@@ -1055,46 +1172,122 @@ async def ensure_connected(client):
 
 
 async def resolve_channel_peer(client, chat_id):
-    """Kanalning peer'ini resolve qiladi — CHANNEL_INVALID oldini olish uchun.
+    """Production-grade kanal peer resolver.
+
+    TUZATISH: CHANNEL_INVALID — to'g'ri access_hash bilan resolve qiladi.
+
+    Qoidalar:
+    - HECH QACHON access_hash=0 ishlatilmaydi
+    - Har doim client.get_chat yoki resolve_peer orqali haqiqiy access_hash olinadi
+    - Kesh mavjud — takroriy so'rovlar serverga borilmaydi
+    - Exponential backoff bilan retry (3 urinish)
+    - FloodWait aniq handle qilinadi
+    - Public (@username) va private (t.me/c/...) linklar qo'llab-quvvatlanadi
+    - User a'zo bo'lmasa graceful fail
+
     chat_id: int (-100...) yoki str (username).
     Muvaffaqiyatli bo'lsa True, aks holda False qaytaradi.
     """
-    try:
-        # Avval oddiy resolve_peer bilan urinib ko'ramiz
-        await client.resolve_peer(chat_id)
-        return True
-    except (ChannelInvalid, ChannelPrivate):
-        pass
-    except Exception:
-        pass
+    global _resolved_peers_cache
 
-    # Raw API orqali kanal ID ni resolve qilish
-    try:
-        if isinstance(chat_id, int) and str(chat_id).startswith("-100"):
-            # -100 prefiksini olib, raw channel_id olish
-            raw_channel_id = int(str(chat_id)[4:])
-            input_channel = types.InputChannel(
-                channel_id=raw_channel_id,
-                access_hash=0
-            )
-            result = await client.invoke(
-                functions.channels.GetChannels(
-                    id=[input_channel]
+    # ── Kesh tekshiruvi — agar avval resolve qilingan bo'lsa, qayta so'rov kerak emas ──
+    cache_key = str(chat_id)
+    if cache_key in _resolved_peers_cache:
+        # Keshda bor, lekin peer hali ham validmi tekshiramiz (resolve_peer kesh ichida)
+        try:
+            await client.resolve_peer(chat_id)
+            return True
+        except Exception:
+            # Kesh eskirgan — o'chirib, qayta resolve qilamiz
+            _resolved_peers_cache.pop(cache_key, None)
+            logger.debug(f"Cached peer for {chat_id} is stale, re-resolving...")
+
+    RESOLVE_MAX_RETRIES = 3
+    RESOLVE_BASE_DELAY = 2  # sekundda
+
+    for attempt in range(RESOLVE_MAX_RETRIES):
+        try:
+            # ── 1-usul: resolve_peer — ichki peer keshidan (eng tez) ──
+            try:
+                peer = await client.resolve_peer(chat_id)
+                if peer:
+                    _resolved_peers_cache[cache_key] = True
+                    logger.debug(f"Channel {chat_id} resolved via resolve_peer (attempt {attempt+1})")
+                    return True
+            except (ChannelInvalid, ChannelPrivate, KeyError, ValueError):
+                pass
+            except FloodWait as fw:
+                wait = fw.value
+                logger.warning(f"FloodWait {wait}s during resolve_peer({chat_id})")
+                await asyncio.sleep(wait)
+                continue
+            except Exception:
+                pass
+
+            # ── 2-usul: get_chat — serverdan to'liq ma'lumot + access_hash ──
+            try:
+                chat = await client.get_chat(chat_id)
+                if chat:
+                    _resolved_peers_cache[cache_key] = True
+                    logger.info(f"Channel {chat_id} resolved via get_chat (attempt {attempt+1})")
+                    return True
+            except (ChannelInvalid, ChannelPrivate):
+                # User a'zo emas yoki kanal private — get_dialogs bilan urinib ko'ramiz
+                pass
+            except FloodWait as fw:
+                wait = fw.value
+                logger.warning(f"FloodWait {wait}s during get_chat({chat_id})")
+                await asyncio.sleep(wait)
+                continue
+            except Exception as e:
+                logger.debug(f"get_chat({chat_id}) failed: {type(e).__name__}: {e}")
+
+            # ── 3-usul: get_dialogs — barcha dialoglar orasidan qidirish ──
+            # Bu eng sekin usul, lekin eng ishonchli
+            # Faqat int chat_id uchun (username uchun get_chat ishlashi kerak)
+            try:
+                logger.info(f"Resolving channel {chat_id} via get_dialogs scan (attempt {attempt+1})...")
+                target_id = chat_id
+                found = False
+                async for dialog in client.get_dialogs():
+                    if dialog.chat and dialog.chat.id == target_id:
+                        found = True
+                        break
+                if found:
+                    _resolved_peers_cache[cache_key] = True
+                    logger.info(f"Channel {chat_id} found via get_dialogs")
+                    # Endi resolve_peer ishlashi kerak (peer keshga tushdi)
+                    return True
+            except FloodWait as fw:
+                wait = fw.value
+                logger.warning(f"FloodWait {wait}s during get_dialogs for {chat_id}")
+                await asyncio.sleep(wait)
+                continue
+            except Exception as e:
+                logger.debug(f"get_dialogs scan for {chat_id} failed: {e}")
+
+            # Barcha usullar muvaffaqiyatsiz — retry bilan
+            if attempt < RESOLVE_MAX_RETRIES - 1:
+                delay = RESOLVE_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    f"Channel {chat_id} resolve failed (attempt {attempt+1}/{RESOLVE_MAX_RETRIES}). "
+                    f"Retrying in {delay}s..."
                 )
-            )
-            if result and hasattr(result, 'chats') and result.chats:
-                logger.info(f"Channel {chat_id} resolved via Raw API")
-                return True
-    except Exception as raw_err:
-        logger.debug(f"Raw API channel resolve failed: {raw_err}")
+                await asyncio.sleep(delay)
+            else:
+                logger.warning(f"Channel {chat_id} could not be resolved after {RESOLVE_MAX_RETRIES} attempts")
 
-    # get_chat bilan urinib ko'ramiz
-    try:
-        await client.get_chat(chat_id)
-        return True
-    except Exception as e:
-        logger.warning(f"Could not resolve channel {chat_id}: {e}")
-        return False
+        except FloodWait as fw:
+            # Tashqi FloodWait
+            wait = fw.value
+            logger.warning(f"FloodWait {wait}s at resolve attempt {attempt+1}")
+            await asyncio.sleep(wait)
+        except Exception as outer_err:
+            logger.error(f"Unexpected error resolving {chat_id} (attempt {attempt+1}): {outer_err}")
+            if attempt < RESOLVE_MAX_RETRIES - 1:
+                await asyncio.sleep(RESOLVE_BASE_DELAY * (2 ** attempt))
+
+    return False
 
 
 async def create_client_session(session_string, client_name="saverestricted"):
@@ -2306,10 +2499,10 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
         )
         return _EMPTY
 
-    # Absolute path — faqat str path uchun (BytesIO emas)
+    # TUZATISH: DOCUMENT_INVALID — download qilingan fayl bo'sh bo'lsa
     if isinstance(file, str):
         file = os.path.abspath(file)
-        if not os.path.exists(file):
+        if not os.path.exists(file) or os.path.getsize(file) == 0:
             if smsg:
                 try:
                     await client.delete_messages(message.chat.id, [smsg.id])
