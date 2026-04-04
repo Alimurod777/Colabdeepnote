@@ -2469,19 +2469,21 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
             dosta = asyncio.create_task(downstatus(client, prog_key, smsg, down_event))
 
     # Download — har doim diskka (progress RAMda saqlanadi)
-    request_user_id = message.from_user.id if getattr(message, "from_user", None) else message.chat.id
-    user_temp_dir = os.path.join("downloads", f"user_{request_user_id}")
+    request_scope_id = message.from_user.id if getattr(message, "from_user", None) else message.chat.id
+    user_temp_dir = os.path.join("downloads", f"user_{request_scope_id}")
     os.makedirs(user_temp_dir, exist_ok=True)
 
-    file_ext = ""
+    default_extensions = {
+        "Video": ".mp4",
+        "Audio": ".mp3",
+        "Photo": ".jpg",
+    }
+    file_ext = default_extensions.get(msg_type, "")
     if msg_type == "Document" and getattr(msg, "document", None) and getattr(msg.document, "file_name", None):
-        file_ext = os.path.splitext(msg.document.file_name)[1]
-    elif msg_type == "Video":
-        file_ext = ".mp4"
-    elif msg_type == "Audio":
-        file_ext = ".mp3"
-    elif msg_type == "Photo":
-        file_ext = ".jpg"
+        raw_ext = os.path.splitext(msg.document.file_name)[1]
+        file_ext = re.sub(r"[^A-Za-z0-9.]", "", raw_ext)[:15]
+        if file_ext and not file_ext.startswith("."):
+            file_ext = f".{file_ext}"
 
     download_path = os.path.join(user_temp_dir, f"{chatid}_{msgid}{file_ext}")
 
