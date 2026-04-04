@@ -2470,8 +2470,11 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
             dosta = asyncio.create_task(downstatus(client, prog_key, smsg, down_event))
 
     # Download — har doim diskka (progress RAMda saqlanadi)
-    request_scope_id = message.from_user.id if getattr(message, "from_user", None) else message.chat.id
-    user_temp_dir = os.path.join("downloads", f"user_{request_scope_id}")
+    try:
+        user_or_chat_id = int(message.from_user.id if getattr(message, "from_user", None) else message.chat.id)
+    except (TypeError, ValueError, AttributeError):
+        user_or_chat_id = int(message.chat.id)
+    user_temp_dir = os.path.join("downloads", f"user_{user_or_chat_id}")
     os.makedirs(user_temp_dir, exist_ok=True)
 
     default_extensions = {
@@ -2482,10 +2485,18 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
     file_ext = default_extensions.get(msg_type, "")
     if msg_type == "Document" and getattr(msg, "document", None) and getattr(msg.document, "file_name", None):
         raw_ext = os.path.splitext(msg.document.file_name)[1]
-        safe_ext = re.sub(r"[^A-Za-z0-9]", "", raw_ext.lstrip("."))
+        safe_ext = re.sub(r"[^A-Za-z0-9]", "", raw_ext.lstrip(".")).lower()
         file_ext = f".{safe_ext[:MAX_SAFE_EXT_LENGTH]}" if safe_ext else ""
 
-    download_path = os.path.join(user_temp_dir, f"{chatid}_{msgid}{file_ext}")
+    try:
+        safe_chatid = int(chatid)
+    except (TypeError, ValueError):
+        safe_chatid = int(message.chat.id)
+    try:
+        safe_msgid = int(msgid)
+    except (TypeError, ValueError):
+        safe_msgid = int(message.id)
+    download_path = os.path.join(user_temp_dir, f"{safe_chatid}_{safe_msgid}{file_ext}")
 
     for dl_attempt in range(MAX_RETRIES):
             try:
