@@ -504,6 +504,10 @@ async def upload_via_user_session(
                                 continue
                             raise
 
+                    # BytesIO qayta urinishda pointer oxirida qolib ketmasligi uchun
+                    if isinstance(part_path, io.BytesIO):
+                        part_path.seek(0)
+
                     if msg_type == "Video":
                         await uclient.send_video(
                             chat_id=chat_id, video=part_path,
@@ -654,6 +658,33 @@ async def upload_via_user_session(
                         raise
                 except Exception as send_err:
                     err_str = str(send_err).lower()
+                    # TUZATISH: FILE_PART_INVALID — upload media session buzilgan bo'lishi mumkin
+                    if "file_part_invalid" in err_str:
+                        logger.warning(
+                            f"User {user_id}: FILE_PART_INVALID on upload (attempt {attempt+1}/{MAX_UPLOAD_RETRIES})"
+                        )
+                        if attempt < MAX_UPLOAD_RETRIES - 1:
+                            try:
+                                if uclient.is_connected:
+                                    await uclient.disconnect()
+                            except Exception:
+                                pass
+                            try:
+                                await asyncio.sleep(1)
+                                await uclient.connect()
+                                uclient.me = await uclient.get_me()
+                                await _resolve_bot_peer(uclient, chat_id)
+                            except Exception as rc_err:
+                                logger.error(f"User {user_id}: reconnect after FILE_PART_INVALID failed: {rc_err}")
+                            await asyncio.sleep(RETRY_DELAYS[attempt])
+                            continue
+                        await safe_send_message(
+                            bot, user_id,
+                            "❌ **Upload xatosi:** `FILE_PART_INVALID`.\n"
+                            "Iltimos qayta urinib ko'ring."
+                        )
+                        raise
+
                     # TUZATISH: PEER_ID_INVALID — bot peer keshdan tushib ketgan
                     if "peer_id_invalid" in err_str or "peer id" in err_str:
                         logger.warning(f"User {user_id}: PEER_ID_INVALID — re-resolving bot peer (attempt {attempt+1})")
@@ -1292,10 +1323,14 @@ async def resolve_channel_peer(client, chat_id):
 
 async def create_client_session(session_string, client_name="saverestricted"):
     client = None
+    # Bir xil session nomi bilan parallel clientlar to'qnashmasligi uchun
+    if not client_name:
+        client_name = "saverestricted"
+    unique_client_name = f"{client_name}_{int(time.time() * 1000)}_{abs(hash(session_string)) % 10000}"
     for attempt in range(MAX_RETRIES):
         try:
             client = Client(
-                client_name,
+                unique_client_name,
                 session_string=session_string,
                 api_hash=API_HASH,
                 api_id=API_ID,
@@ -1312,7 +1347,7 @@ async def create_client_session(session_string, client_name="saverestricted"):
                 client.me = await client.get_me()
             except Exception:
                 pass
-            logger.info(f"Client session '{client_name}' connected (attempt {attempt+1})")
+            logger.info(f"Client session '{unique_client_name}' connected (attempt {attempt+1})")
             return client, None
         except Exception as e:
             if client:
