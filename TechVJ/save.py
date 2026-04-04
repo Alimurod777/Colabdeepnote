@@ -2469,12 +2469,33 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
             dosta = asyncio.create_task(downstatus(client, prog_key, smsg, down_event))
 
     # Download — har doim diskka (progress RAMda saqlanadi)
+    request_user_id = message.from_user.id if getattr(message, "from_user", None) else message.chat.id
+    user_temp_dir = os.path.join("downloads", f"user_{request_user_id}")
+    os.makedirs(user_temp_dir, exist_ok=True)
+
+    file_ext = ""
+    if msg_type == "Document" and getattr(msg, "document", None) and getattr(msg.document, "file_name", None):
+        file_ext = os.path.splitext(msg.document.file_name)[1]
+    elif msg_type == "Video":
+        file_ext = ".mp4"
+    elif msg_type == "Audio":
+        file_ext = ".mp3"
+    elif msg_type == "Photo":
+        file_ext = ".jpg"
+
+    download_path = os.path.join(user_temp_dir, f"{chatid}_{msgid}{file_ext}")
+
     for dl_attempt in range(MAX_RETRIES):
             try:
                 if show_progress:
-                    file = await acc.download_media(msg, progress=progress, progress_args=[prog_key, "down"])
+                    file = await acc.download_media(
+                        msg,
+                        file_name=download_path,
+                        progress=progress,
+                        progress_args=[prog_key, "down"]
+                    )
                 else:
-                    file = await acc.download_media(msg)
+                    file = await acc.download_media(msg, file_name=download_path)
 
                 # downstatus loopini to'xtatish
                 if down_event:
