@@ -158,6 +158,7 @@ def get_ffmpeg():
 
 TWO_GB = 2 * 1024 * 1024 * 1024  # 2GB bytes
 FOUR_GB = 4 * 1024 * 1024 * 1024  # 4GB bytes
+MAX_SAFE_EXT_LENGTH = 10
 
 
 async def split_file(file_path: str, chunk_size_bytes: int = TWO_GB) -> list:
@@ -2481,9 +2482,8 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
     file_ext = default_extensions.get(msg_type, "")
     if msg_type == "Document" and getattr(msg, "document", None) and getattr(msg.document, "file_name", None):
         raw_ext = os.path.splitext(msg.document.file_name)[1]
-        file_ext = re.sub(r"[^A-Za-z0-9.]", "", raw_ext)[:15]
-        if file_ext and not file_ext.startswith("."):
-            file_ext = f".{file_ext}"
+        safe_ext = re.sub(r"[^A-Za-z0-9]", "", raw_ext.lstrip("."))
+        file_ext = f".{safe_ext[:MAX_SAFE_EXT_LENGTH]}" if safe_ext else ""
 
     download_path = os.path.join(user_temp_dir, f"{chatid}_{msgid}{file_ext}")
 
