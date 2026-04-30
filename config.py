@@ -2,7 +2,8 @@ import os
 
 # ── Hardcoded defaults — shu yerga to'g'ridan-to'g'ri yozish mumkin ──
 # .env yoki environment variable bo'lmasa quyidagi qiymatlar ishlatiladi.
-# Haqiqiy qiymatlaringizni shu yerga yozing:
+# Haqiqiy qiymatlaringizni shu yerga yozing.
+# DIQQAT: Haqiqiy tokenlarni git'ga push qilmang — .gitignore ga qo'shing yoki .env ishlatishni tavsiya etamiz.
 _BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"       # misol: "123456:ABCdefGHIjklMNOpqrSTUvwxYZ"
 _API_ID    = 0                            # misol: 12345678
 _API_HASH  = "YOUR_API_HASH_HERE"        # misol: "abcdef1234567890abcdef1234567890"
@@ -20,6 +21,6 @@ try:
 except Exception:
     # decouple o'rnatilmagan bo'lsa to'g'ridan-to'g'ri os.environ
     BOT_TOKEN = os.environ.get("BOT_TOKEN") or _BOT_TOKEN
-    API_ID    = int(os.environ.get("API_ID") or _API_ID)
+    API_ID    = int(os.environ.get("API_ID") or _API_ID or 0)
     API_HASH  = os.environ.get("API_HASH") or _API_HASH
     DB_URI    = os.environ.get("DB_URI") or _DB_URI
