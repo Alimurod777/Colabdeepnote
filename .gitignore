@@ -3,3 +3,5 @@ staticfiles/ffprobe
 sessions/local_db.json
 sessions/*.session
 .env
+__pycache__/
+*.pyc
