@@ -28,7 +28,7 @@ def _coerce_int(value, fallback=0):
 
 
 def _load_dotenv(path):
-    """Oddiy .env parser — python-dotenv shart emas."""
+    """Oddiy .env parser — multiline/escape yo'q, o'qilmasa jim o'tadi."""
     result = {}
     if not os.path.exists(path):
         return result
@@ -43,6 +43,7 @@ def _load_dotenv(path):
                 key, _, val = line.partition("=")
                 result[key.strip()] = _strip_outer_quotes(val.strip())
     except OSError:
+        # .env o'qilmasa ham fallback ishlashi uchun jim o'tamiz.
         return result
     return result
 
