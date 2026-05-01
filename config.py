@@ -22,6 +22,10 @@ def _has_value(value):
 
 
 def _coerce_int(value, fallback=0):
+    if value is None:
+        return fallback
+    if isinstance(value, str) and not value.strip():
+        return fallback
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -43,8 +47,6 @@ def _load_dotenv(path):
                     continue
                 key, _, val = line.partition("=")
                 result[key.strip()] = _strip_outer_quotes(val.strip())
-    except FileNotFoundError:
-        return result
     except OSError:
         # .env o'qilmasa ham fallback ishlashi uchun jim o'tamiz.
         return result
@@ -66,9 +68,8 @@ def _get_value(key, default=None):
 
 
 def _get_int(key, default=0):
-    default_int = _coerce_int(default, 0)
-    value = _get_value(key, default_int)
-    return _coerce_int(value, default_int)
+    value = _get_value(key, default)
+    return _coerce_int(value, _coerce_int(default, 0))
 
 
 BOT_TOKEN = _get_value("BOT_TOKEN", _BOT_TOKEN)
