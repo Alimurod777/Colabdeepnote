@@ -10,6 +10,23 @@ _API_HASH  = "YOUR_API_HASH_HERE"        # misol: "abcdef1234567890abcdef1234567
 _DB_URI    = "YOUR_MONGODB_URI_HERE"     # misol: "mongodb+srv://user:pass@cluster.mongodb.net/dbname"
 
 # ── Ustuvorlik tartibi: 1) loyiha ichidagi .env 2) tizim env 3) config.py ──
+def _strip_outer_quotes(value):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _has_value(value):
+    return value is not None and value != ""
+
+
+def _coerce_int(value, fallback=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _load_dotenv(path):
     """Oddiy .env parser — python-dotenv shart emas."""
     result = {}
@@ -24,10 +41,7 @@ def _load_dotenv(path):
                 if "=" not in line:
                     continue
                 key, _, val = line.partition("=")
-                val = val.strip()
-                if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-                    val = val[1:-1]
-                result[key.strip()] = val
+                result[key.strip()] = _strip_outer_quotes(val.strip())
     except OSError:
         return result
     return result
@@ -48,18 +62,9 @@ def _get_value(key, default=None):
 
 
 def _get_int(key, default=0):
-    value = _get_value(key, default)
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        try:
-            return int(default)
-        except (TypeError, ValueError):
-            return 0
-
-
-def _has_value(value):
-    return value is not None and value != ""
+    default_int = _coerce_int(default, 0)
+    value = _get_value(key, default_int)
+    return _coerce_int(value, default_int)
 
 
 BOT_TOKEN = _get_value("BOT_TOKEN", _BOT_TOKEN)
