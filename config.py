@@ -22,14 +22,18 @@ def _has_value(value):
 
 
 def _coerce_int(value, fallback=0):
+    try:
+        fallback_int = int(fallback)
+    except (TypeError, ValueError):
+        fallback_int = 0
     if value is None:
-        return fallback
+        return fallback_int
     if isinstance(value, str) and not value.strip():
-        return fallback
+        return fallback_int
     try:
         return int(value)
     except (TypeError, ValueError):
-        return fallback
+        return fallback_int
 
 
 def _load_dotenv(path):
@@ -69,7 +73,7 @@ def _get_value(key, default=None):
 
 def _get_int(key, default=0):
     value = _get_value(key, default)
-    return _coerce_int(value, _coerce_int(default, 0))
+    return _coerce_int(value, default)
 
 
 BOT_TOKEN = _get_value("BOT_TOKEN", _BOT_TOKEN)
