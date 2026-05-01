@@ -10,6 +10,7 @@ _API_HASH  = "YOUR_API_HASH_HERE"        # misol: "abcdef1234567890abcdef1234567
 _DB_URI    = "YOUR_MONGODB_URI_HERE"     # misol: "mongodb+srv://user:pass@cluster.mongodb.net/dbname"
 
 # ── Ustuvorlik tartibi: 1) loyiha ichidagi .env 2) tizim env 3) config.py ──
+# .env fayl config.py bilan bir papkada bo'lishi kerak; parser oddiy (multiline/escape yo'q).
 def _strip_outer_quotes(value):
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         return value[1:-1]
@@ -42,6 +43,8 @@ def _load_dotenv(path):
                     continue
                 key, _, val = line.partition("=")
                 result[key.strip()] = _strip_outer_quotes(val.strip())
+    except FileNotFoundError:
+        return result
     except OSError:
         # .env o'qilmasa ham fallback ishlashi uchun jim o'tamiz.
         return result
