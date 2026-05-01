@@ -15,15 +15,21 @@ def _load_dotenv(path):
     result = {}
     if not os.path.exists(path):
         return result
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            result[key.strip()] = val.strip().strip('"').strip("'")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                val = val.strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                    val = val[1:-1]
+                result[key.strip()] = val
+    except OSError:
+        return result
     return result
 
 
@@ -33,10 +39,10 @@ _DOTENV = _load_dotenv(_ENV_PATH)
 
 def _get_value(key, default=None):
     dotenv_val = _DOTENV.get(key)
-    if dotenv_val not in (None, ""):
+    if _has_value(dotenv_val):
         return dotenv_val
     env_val = os.environ.get(key)
-    if env_val not in (None, ""):
+    if _has_value(env_val):
         return env_val
     return default
 
@@ -50,6 +56,10 @@ def _get_int(key, default=0):
             return int(default)
         except (TypeError, ValueError):
             return 0
+
+
+def _has_value(value):
+    return value is not None and value != ""
 
 
 BOT_TOKEN = _get_value("BOT_TOKEN", _BOT_TOKEN)
