@@ -1982,7 +1982,6 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
                         message.chat.id, status_msg.id,
                         f"⏳ {processed}/{total} xabar..."
                     )
-                await asyncio.sleep(0)
         finally:
             await mark_acc_for_close(acc)
 
@@ -2024,7 +2023,6 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
                         message.chat.id, status_msg.id,
                         f"⏳ {processed}/{total} xabar..."
                     )
-                await asyncio.sleep(0)
         finally:
             await mark_acc_for_close(acc)
 
@@ -2088,7 +2086,6 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
                         message.chat.id, status_msg.id,
                         f"⏳ {processed}/{total} xabar..."
                     )
-                await asyncio.sleep(0)
         finally:
             if acc:
                 await mark_acc_for_close(acc)
@@ -2181,7 +2178,6 @@ async def handle_comment_thread(client: Client, message: Message, url):
                         # Completely suppress all errors
                         pass
                 
-                await asyncio.sleep(0)
                 
             except Exception:
                 # Completely suppress all errors for individual messages
@@ -2324,7 +2320,6 @@ async def handle_topic(client: Client, message: Message, url):
                     print(f"[handle_topic] inner msg_id={msg_id}: {type(inner_err).__name__}: {inner_err}")
                     pass
 
-                await asyncio.sleep(0)
 
             except Exception as outer_err:
                 # Suppress all errors for individual messages
