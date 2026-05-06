@@ -26,6 +26,8 @@ class FloodWaitController:
         self.user_wait_until: Dict[int, float] = {}
         self.user_retry_delay: Dict[int, float] = {}
         self.user_upload_semaphores: Dict[int, asyncio.Semaphore] = {}
+        self.user_last_flood_wait: Dict[int, float] = {}
+        self.user_last_flood_time: Dict[int, float] = {}
         
     async def wait_if_needed(self, user_id: int) -> None:
         """Wait if user hit flood limit"""
@@ -40,7 +42,25 @@ class FloodWaitController:
     async def handle_flood_wait(self, user_id: int, flood_wait_seconds: int) -> None:
         """Handle FloodWait error"""
         self.user_wait_until[user_id] = time.time() + flood_wait_seconds
+        self.user_last_flood_wait[user_id] = float(flood_wait_seconds)
+        self.user_last_flood_time[user_id] = time.time()
         logger.warning(f"User {user_id}: FloodWait set to {flood_wait_seconds}s")
+
+    def get_recent_flood_wait(self, user_id: int, window_seconds: int = 300) -> float:
+        """Return recent FloodWait value if it happened within the given window."""
+        last_time = self.user_last_flood_time.get(user_id)
+        if not last_time:
+            return 0.0
+        if time.time() - last_time > window_seconds:
+            return 0.0
+        return float(self.user_last_flood_wait.get(user_id, 0.0))
+
+    def get_upload_delay(self, user_id: int, base_delay: float, max_delay: float) -> float:
+        """Compute adaptive delay based on recent FloodWait feedback."""
+        flood_wait = self.get_recent_flood_wait(user_id)
+        if flood_wait <= 0:
+            return base_delay
+        return min(max_delay, max(base_delay, flood_wait / 2))
     
     def get_lock(self, user_id: int) -> asyncio.Lock:
         """Get or create lock for user"""

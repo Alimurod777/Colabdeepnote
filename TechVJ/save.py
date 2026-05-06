@@ -27,6 +27,7 @@ import io
 import aiofiles
 from TechVJ.progress_store import write_progress, read_progress, clear_progress
 from TechVJ.buffer_manager import buffer_mgr
+from TechVJ.upload_queue import queue_upload, start_upload_workers, upload_queue as upload_task_queue
 
 logger = logging.getLogger(__name__)
 
@@ -161,8 +162,172 @@ FOUR_GB = 4 * 1024 * 1024 * 1024  # 4GB bytes
 MAX_SAFE_EXT_LENGTH = 10
 FLOOD_WAIT_BUFFER_SECONDS = 2
 UPLOAD_THROTTLE_MIN_BYTES = 100 * 1024 * 1024
-UPLOAD_CHUNK_THROTTLE_BYTES = 4 * 1024 * 1024
+UPLOAD_CHUNK_THROTTLE_BYTES = 2 * 1024 * 1024
 UPLOAD_CHUNK_THROTTLE_DELAY = 0.15
+
+DEFAULT_DOWNLOAD_WORKERS = 32
+MAX_DOWNLOAD_WORKERS = 150
+MIN_DOWNLOAD_WORKERS = 4
+UPLOAD_QUEUE_BACKPRESSURE_THRESHOLD = 60
+UPLOAD_QUEUE_CRITICAL_THRESHOLD = 120
+DOWNLOAD_QUEUE_MAXSIZE = 1000
+DOWNLOAD_BACKPRESSURE_DELAY = 1.0
+DOWNLOAD_ADJUST_INTERVAL = 2.0
+
+download_queue: asyncio.Queue = asyncio.Queue(maxsize=DOWNLOAD_QUEUE_MAXSIZE)
+_download_workers_started = False
+_download_start_lock = asyncio.Lock()
+_acc_lock = asyncio.Lock()
+_acc_pending_counts: dict[int, int] = {}
+_acc_close_requested: dict[int, bool] = {}
+_acc_objects: dict[int, object] = {}
+
+
+class AdaptiveDownloadLimiter:
+    def __init__(self, limit: int):
+        self._limit = limit
+        self._active = 0
+        self._cond = asyncio.Condition()
+
+    async def acquire(self) -> None:
+        async with self._cond:
+            while self._active >= self._limit:
+                await self._cond.wait()
+            self._active += 1
+
+    async def release(self) -> None:
+        async with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify_all()
+
+    async def set_limit(self, new_limit: int) -> None:
+        async with self._cond:
+            self._limit = max(MIN_DOWNLOAD_WORKERS, new_limit)
+            self._cond.notify_all()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+
+_download_limiter = AdaptiveDownloadLimiter(DEFAULT_DOWNLOAD_WORKERS)
+
+
+async def _apply_download_backpressure() -> None:
+    while upload_task_queue.qsize() >= UPLOAD_QUEUE_BACKPRESSURE_THRESHOLD:
+        await asyncio.sleep(DOWNLOAD_BACKPRESSURE_DELAY)
+
+
+async def _download_limit_controller() -> None:
+    last_limit = _download_limiter.limit
+    while True:
+        upload_backlog = upload_task_queue.qsize()
+        download_backlog = download_queue.qsize()
+        target = DEFAULT_DOWNLOAD_WORKERS
+
+        if upload_backlog >= UPLOAD_QUEUE_CRITICAL_THRESHOLD:
+            target = max(MIN_DOWNLOAD_WORKERS, DEFAULT_DOWNLOAD_WORKERS // 4)
+        elif upload_backlog >= UPLOAD_QUEUE_BACKPRESSURE_THRESHOLD:
+            target = max(MIN_DOWNLOAD_WORKERS, DEFAULT_DOWNLOAD_WORKERS // 2)
+        elif download_backlog > DEFAULT_DOWNLOAD_WORKERS:
+            target = min(MAX_DOWNLOAD_WORKERS, DEFAULT_DOWNLOAD_WORKERS + download_backlog // 2)
+
+        if target != last_limit:
+            await _download_limiter.set_limit(target)
+            last_limit = target
+            logger.info(f"[DOWNLOAD] Adaptive workers set to {target} (upload backlog: {upload_backlog})")
+
+        await asyncio.sleep(DOWNLOAD_ADJUST_INTERVAL)
+
+
+async def _download_worker(worker_id: int) -> None:
+    while True:
+        job = await download_queue.get()
+        try:
+            await _apply_download_backpressure()
+            await _download_limiter.acquire()
+            try:
+                await handle_private(job["client"], job["acc"], job["message"], job["chatid"], job["msgid"])
+            finally:
+                await _download_limiter.release()
+                await _release_acc_job(job.get("acc"))
+        except Exception as err:
+            logger.warning(f"[DOWNLOAD] Worker {worker_id} error: {err}")
+        finally:
+            download_queue.task_done()
+
+
+async def ensure_transfer_pipeline() -> None:
+    global _download_workers_started
+    if _download_workers_started:
+        return
+    async with _download_start_lock:
+        if _download_workers_started:
+            return
+        start_upload_workers()
+        for idx in range(MAX_DOWNLOAD_WORKERS):
+            asyncio.create_task(_download_worker(idx))
+        asyncio.create_task(_download_limit_controller())
+        _download_workers_started = True
+
+
+async def queue_download(client: Client, acc, message: Message, chatid: int, msgid: int) -> None:
+    await ensure_transfer_pipeline()
+    await _register_acc_job(acc)
+    try:
+        await download_queue.put({
+            "client": client,
+            "acc": acc,
+            "message": message,
+            "chatid": chatid,
+            "msgid": msgid,
+        })
+    except Exception:
+        await _release_acc_job(acc)
+        raise
+
+
+async def mark_acc_for_close(acc) -> None:
+    if acc is None:
+        return
+    key = id(acc)
+    should_close = False
+    async with _acc_lock:
+        _acc_close_requested[key] = True
+        if _acc_pending_counts.get(key, 0) <= 0:
+            acc_obj = _acc_objects.pop(key, acc)
+            _acc_close_requested.pop(key, None)
+            _acc_pending_counts.pop(key, None)
+            should_close = True
+    if should_close:
+        await safe_disconnect(acc_obj)
+
+
+async def _register_acc_job(acc) -> None:
+    if acc is None:
+        return
+    key = id(acc)
+    async with _acc_lock:
+        _acc_pending_counts[key] = _acc_pending_counts.get(key, 0) + 1
+        _acc_objects[key] = acc
+
+
+async def _release_acc_job(acc) -> None:
+    if acc is None:
+        return
+    key = id(acc)
+    should_close = False
+    acc_obj = acc
+    async with _acc_lock:
+        if key in _acc_pending_counts:
+            _acc_pending_counts[key] = max(0, _acc_pending_counts[key] - 1)
+        if _acc_pending_counts.get(key, 0) <= 0:
+            _acc_pending_counts.pop(key, None)
+            acc_obj = _acc_objects.pop(key, acc)
+            if _acc_close_requested.pop(key, None):
+                should_close = True
+    if should_close:
+        await safe_disconnect(acc_obj)
 
 
 async def split_file(file_path: str, chunk_size_bytes: int = TWO_GB) -> list:
@@ -1808,7 +1973,7 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
                             "❌ Session uzildi, qayta ulanib bo'lmadi.",
                             reply_to_message_id=message.id)
                         break
-                    await handle_private(client, acc, message, chatid, msgid)
+                    await queue_download(client, acc, message, chatid, msgid)
                     processed += 1
                 except Exception as e:
                     print(f"[process_posts] msgid={msgid} xatosi: {type(e).__name__}: {e}")
@@ -1817,9 +1982,9 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
                         message.chat.id, status_msg.id,
                         f"⏳ {processed}/{total} xabar..."
                     )
-                await asyncio.sleep(2)
+                await asyncio.sleep(0)
         finally:
-            await safe_disconnect(acc)
+            await mark_acc_for_close(acc)
 
     # ── Bot chat: https://t.me/b/BOTUSERNAME/MSGID ──
     elif "https://t.me/b/" in url:
@@ -1850,7 +2015,7 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
                             "❌ Session uzildi, qayta ulanib bo'lmadi.",
                             reply_to_message_id=message.id)
                         break
-                    await handle_private(client, acc, message, username, msgid)
+                    await queue_download(client, acc, message, username, msgid)
                     processed += 1
                 except Exception:
                     pass
@@ -1859,9 +2024,9 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
                         message.chat.id, status_msg.id,
                         f"⏳ {processed}/{total} xabar..."
                     )
-                await asyncio.sleep(2)
+                await asyncio.sleep(0)
         finally:
-            await safe_disconnect(acc)
+            await mark_acc_for_close(acc)
 
     # ── Ochiq kanal: https://t.me/USERNAME/MSGID ──
     else:
@@ -1913,7 +2078,7 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
                                 await client.send_message(message.chat.id, txt, reply_to_message_id=message.id)
                             return
                     try:
-                        await handle_private(client, acc, message, username, msgid)
+                        await queue_download(client, acc, message, username, msgid)
                         processed += 1
                     except Exception:
                         pass
@@ -1923,16 +2088,16 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
                         message.chat.id, status_msg.id,
                         f"⏳ {processed}/{total} xabar..."
                     )
-                await asyncio.sleep(2)
+                await asyncio.sleep(0)
         finally:
             if acc:
-                await safe_disconnect(acc)
+                await mark_acc_for_close(acc)
 
     # Yakuniy status
     if status_msg:
         await client.edit_message_text(
             message.chat.id, status_msg.id,
-            f"✅ Tayyor! {processed}/{total} xabar yuborildi."
+            f"✅ Tayyor! {processed}/{total} xabar yuklash navbatiga qo'shildi."
         )
 
 # Handle comment threads
@@ -2010,13 +2175,13 @@ async def handle_comment_thread(client: Client, message: Message, url):
                 else:
                     # For media messages, use regular handler
                     try:
-                        await handle_private(client, acc, message, chat_id, msg_id)
+                        await queue_download(client, acc, message, chat_id, msg_id)
                         processed_count += 1
                     except Exception:
                         # Completely suppress all errors
                         pass
                 
-                await asyncio.sleep(2)  # Add delay between messages
+                await asyncio.sleep(0)
                 
             except Exception:
                 # Completely suppress all errors for individual messages
@@ -2024,14 +2189,14 @@ async def handle_comment_thread(client: Client, message: Message, url):
         
         # Update status when complete
         if processed_count > 0:
-            await client.edit_message_text(message.chat.id, status_msg.id, f"Comment thread download completed! Processed {processed_count} messages.")
+            await client.edit_message_text(message.chat.id, status_msg.id, f"Comment thread queued! Processed {processed_count} messages.")
         else:
             await client.edit_message_text(message.chat.id, status_msg.id, "No messages could be processed from this thread.")
         
     except Exception as e:
         await client.send_message(message.chat.id, f"Error processing comment thread: {e}", reply_to_message_id=message.id)
     finally:
-        await safe_disconnect(acc)
+        await mark_acc_for_close(acc)
 
 # Handle topic posts
 async def safe_send_message(client: Client, user_id: int, text: str, **kwargs):
@@ -2149,7 +2314,7 @@ async def handle_topic(client: Client, message: Message, url):
                     else:
                         # For media messages, use regular handler
                         try:
-                            await handle_private(client, acc, message, chat_id, msg_id)
+                            await queue_download(client, acc, message, chat_id, msg_id)
                             processed_count += 1
                         except Exception as hp_err:
                             # Xatoni loglash (jimgina o'tkazib yuborish o'rniga)
@@ -2159,7 +2324,7 @@ async def handle_topic(client: Client, message: Message, url):
                     print(f"[handle_topic] inner msg_id={msg_id}: {type(inner_err).__name__}: {inner_err}")
                     pass
 
-                await asyncio.sleep(1)  # Shorter delay between messages
+                await asyncio.sleep(0)
 
             except Exception as outer_err:
                 # Suppress all errors for individual messages
@@ -2170,7 +2335,7 @@ async def handle_topic(client: Client, message: Message, url):
         if status_msg:
             try:
                 if processed_count > 0:
-                    await client.edit_message_text(message.chat.id, status_msg.id, f"Topic download completed! Processed {processed_count} messages.")
+                    await client.edit_message_text(message.chat.id, status_msg.id, f"Topic queued! Processed {processed_count} messages.")
                 else:
                     await client.edit_message_text(message.chat.id, status_msg.id, "No messages could be processed from this topic.")
             except Exception as edit_err:
@@ -2179,48 +2344,76 @@ async def handle_topic(client: Client, message: Message, url):
     except Exception as e:
         await safe_send_message(client, message.chat.id, f"Error processing topic: {e}", reply_to_message_id=message.id)
     finally:
-        await safe_disconnect(acc)
+        await mark_acc_for_close(acc)
 
 # handle private
 async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
-    """Wrapper — download qilingan faylni har qanday holatda tozalaydi."""
-    file = None
-    smsg = None
-    down_event = None
-    up_event = None
-    dosta = None
-    upsta = None
+    """Download and enqueue upload without blocking on upload."""
+    upload_job = await _handle_private_inner(client, acc, message, chatid, msgid)
+    if not upload_job:
+        return
+    await _queue_upload_job(upload_job)
+
+
+async def _cleanup_upload_resources(cleanup_payload: dict) -> None:
+    file = cleanup_payload.get("file")
+    smsg = cleanup_payload.get("smsg")
+    down_event = cleanup_payload.get("down_event")
+    up_event = cleanup_payload.get("up_event")
+    dosta = cleanup_payload.get("dosta")
+    upsta = cleanup_payload.get("upsta")
+    client = cleanup_payload.get("client")
+    message = cleanup_payload.get("message")
+
+    if isinstance(file, str) and file and os.path.exists(file):
+        try:
+            os.remove(file)
+        except Exception:
+            pass
+    if up_event and not up_event.is_set():
+        up_event.set()
+    if upsta and not upsta.done():
+        upsta.cancel()
+    if down_event and not down_event.is_set():
+        down_event.set()
+    if dosta and not dosta.done():
+        dosta.cancel()
+    if smsg and client and message:
+        try:
+            await client.delete_messages(message.chat.id, [smsg.id])
+        except Exception:
+            pass
+
+
+async def _queue_upload_job(upload_job: dict) -> None:
+    upload_payload = upload_job["upload_payload"]
+    cleanup_payload = upload_job["cleanup_payload"]
+    second_caption = upload_job.get("second_caption")
+
+    async def _finalize_upload(**_):
+        if second_caption:
+            await safe_send_message(
+                cleanup_payload["client"],
+                cleanup_payload["message"].chat.id,
+                second_caption,
+                reply_to_message_id=cleanup_payload["message"].id
+            )
+        await _cleanup_upload_resources(cleanup_payload)
+
     try:
-        file, smsg, down_event, up_event, dosta, upsta = await _handle_private_inner(
-            client, acc, message, chatid, msgid
+        await queue_upload(
+            upload_via_user_session,
+            upload_payload["user_id"],
+            on_complete=_finalize_upload,
+            on_error=_finalize_upload,
+            **upload_payload
         )
-    except BaseException:
-        # CancelledError ham ushlanadi
+    except Exception:
+        await _cleanup_upload_resources(cleanup_payload)
         raise
-    finally:
-        # ── Fayl tozalash — har doim (success, error, cancel) ──
-        if isinstance(file, str) and file and os.path.exists(file):
-            try:
-                os.remove(file)
-            except Exception:
-                pass
-        # upstatus va progress tozalash
-        if up_event and not up_event.is_set():
-            up_event.set()
-        if upsta and not upsta.done():
-            upsta.cancel()
-        if down_event and not down_event.is_set():
-            down_event.set()
-        if dosta and not dosta.done():
-            dosta.cancel()
-        if smsg:
-            try:
-                await client.delete_messages(message.chat.id, [smsg.id])
-            except Exception:
-                pass
 
 
-_EMPTY = (None, None, None, None, None, None)  # file, smsg, down_event, up_event, dosta, upsta
+_EMPTY = None  # No upload job
 
 
 async def _handle_private_inner(client: Client, acc, message: Message, chatid: int, msgid: int):
@@ -2635,6 +2828,20 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
         reply_markup = msg.reply_markup
 
 
+    upload_payload = {
+        "bot": client,
+        "user_id": message.from_user.id,
+        "file_path": file,
+        "caption": first_caption,
+        "progress_msg": smsg,
+        "target_chat": bot_id,
+        "msg_type": msg_type,
+        "extra": {},
+        "file_size": file_size,
+        "use_ram": use_ram,
+        "existing_client": None,
+    }
+
     if "Document" == msg_type:
         # video extension bo'lsa Video sifatida yuborish
         if isinstance(file, str) and file.endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv', '.webm')):
@@ -2659,170 +2866,61 @@ async def _handle_private_inner(client: Client, acc, message: Message, chatid: i
         else:
             doc_msg_type = "Document"
             extra = {}
-
-        await upload_via_user_session(
-            bot=client,
-            user_id=message.from_user.id,
-            file_path=file,
-            caption=first_caption,
-            progress_msg=smsg,
-            target_chat=bot_id,
-            msg_type=doc_msg_type,
-            extra=extra,
-            file_size=file_size,
-            use_ram=use_ram,
-            existing_client=acc,
-        )
-        if second_caption:
-            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
-
+        upload_payload["msg_type"] = doc_msg_type
+        upload_payload["extra"] = extra
     elif "Video" == msg_type:
-        extra = {
+        upload_payload["msg_type"] = "Video"
+        upload_payload["extra"] = {
             "duration": getattr(msg.video, 'duration', 0) if msg.video else 0,
             "width": getattr(msg.video, 'width', 0) if msg.video else 0,
             "height": getattr(msg.video, 'height', 0) if msg.video else 0,
         }
-        await upload_via_user_session(
-            bot=client,
-            user_id=message.from_user.id,
-            file_path=file,
-            caption=first_caption,
-            progress_msg=smsg,
-            target_chat=bot_id,
-            msg_type="Video",
-            extra=extra,
-            file_size=file_size,
-            use_ram=use_ram,
-            existing_client=acc,
-        )
-        if second_caption:
-            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
-
     elif "VideoNote" == msg_type:
-        extra = {
+        upload_payload["msg_type"] = "VideoNote"
+        upload_payload["extra"] = {
             "duration": getattr(msg.video_note, 'duration', 0) if msg.video_note else 0,
             "length": getattr(msg.video_note, 'length', 0) if msg.video_note else 0,
         }
-        await upload_via_user_session(
-            bot=client,
-            user_id=message.from_user.id,
-            file_path=file,
-            caption=first_caption,
-            progress_msg=smsg,
-            target_chat=bot_id,
-            msg_type="VideoNote",
-            extra=extra,
-            file_size=file_size,
-            use_ram=use_ram,
-            existing_client=acc,
-        )
-
     elif "Voice" == msg_type:
-        extra = {
+        upload_payload["msg_type"] = "Voice"
+        upload_payload["extra"] = {
             "duration": getattr(msg.voice, 'duration', 0) if msg.voice else 0,
         }
-        await upload_via_user_session(
-            bot=client,
-            user_id=message.from_user.id,
-            file_path=file,
-            caption=first_caption,
-            progress_msg=smsg,
-            target_chat=bot_id,
-            msg_type="Voice",
-            extra=extra,
-            file_size=file_size,
-            use_ram=use_ram,
-            existing_client=acc,
-        )
-        if second_caption:
-            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
-
     elif "Audio" == msg_type:
-        extra = {
+        upload_payload["msg_type"] = "Audio"
+        upload_payload["extra"] = {
             "duration": getattr(msg.audio, 'duration', 0) if msg.audio else 0,
             "performer": getattr(msg.audio, 'performer', None) if msg.audio else None,
             "title": getattr(msg.audio, 'title', None) if msg.audio else None,
         }
-        await upload_via_user_session(
-            bot=client,
-            user_id=message.from_user.id,
-            file_path=file,
-            caption=first_caption,
-            progress_msg=smsg,
-            target_chat=bot_id,
-            msg_type="Audio",
-            extra=extra,
-            file_size=file_size,
-            use_ram=use_ram,
-            existing_client=acc,
-        )
-        if second_caption:
-            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
-
     elif "Photo" == msg_type:
-        await upload_via_user_session(
-            bot=client,
-            user_id=message.from_user.id,
-            file_path=file,
-            caption=first_caption,
-            progress_msg=smsg,
-            target_chat=bot_id,
-            msg_type="Photo",
-            file_size=file_size,
-            use_ram=use_ram,
-            existing_client=acc,
-        )
-        if second_caption:
-            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
-
+        upload_payload["msg_type"] = "Photo"
     elif "Animation" == msg_type:
-        await upload_via_user_session(
-            bot=client,
-            user_id=message.from_user.id,
-            file_path=file,
-            caption=first_caption,
-            progress_msg=smsg,
-            target_chat=bot_id,
-            msg_type="Animation",
-            file_size=file_size,
-            use_ram=use_ram,
-            existing_client=acc,
-        )
-        if second_caption:
-            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
-
+        upload_payload["msg_type"] = "Animation"
     elif "Sticker" == msg_type:
-        await upload_via_user_session(
-            bot=client,
-            user_id=message.from_user.id,
-            file_path=file,
-            caption=first_caption,
-            progress_msg=smsg,
-            target_chat=bot_id,
-            msg_type="Sticker",
-            file_size=file_size,
-            use_ram=use_ram,
-            existing_client=acc,
-        )
-
+        upload_payload["msg_type"] = "Sticker"
     else:
-        await upload_via_user_session(
-            bot=client,
-            user_id=message.from_user.id,
-            file_path=file,
-            caption=first_caption,
-            progress_msg=smsg,
-            target_chat=bot_id,
-            msg_type="Document",
-            file_size=file_size,
-            use_ram=use_ram,
-            existing_client=acc,
-        )
-        if second_caption:
-            await safe_send_message(client, message.chat.id, second_caption, reply_to_message_id=message.id)
+        upload_payload["msg_type"] = "Document"
 
-    # Wrapper ga qaytarish — u finally da tozalaydi
-    return file, smsg, down_event, up_event, dosta, upsta
+    cleanup_payload = {
+        "file": file,
+        "smsg": smsg,
+        "down_event": down_event,
+        "up_event": up_event,
+        "dosta": dosta,
+        "upsta": upsta,
+        "client": client,
+        "message": message,
+    }
+
+    if msg_type in ("VideoNote", "Sticker"):
+        second_caption = None
+
+    return {
+        "upload_payload": upload_payload,
+        "cleanup_payload": cleanup_payload,
+        "second_caption": second_caption,
+    }
 
 # get the type of message
 def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
