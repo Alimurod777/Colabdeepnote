@@ -113,11 +113,11 @@ async def _upload_worker(worker_id: int, max_retries: int = 3) -> None:
             for attempt in range(max_retries):
                 try:
                     result = await upload_func(*args, **kwargs)
-                    success = True if result is None else bool(result)
+                    success = result is None or bool(result)
                     last_error = None
                     break
                 except FloodWait as e:
-                    wait_time = getattr(e, 'value', None) or getattr(e, 'x', 0) or 0
+                    wait_time = getattr(e, 'value', getattr(e, 'x', 0))
                     await flood_controller.handle_flood_wait(user_id, int(wait_time))
                     last_error = e
                     if attempt < max_retries - 1:

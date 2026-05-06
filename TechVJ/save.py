@@ -230,7 +230,7 @@ async def _download_limit_controller() -> None:
         elif upload_backlog >= UPLOAD_QUEUE_BACKPRESSURE_THRESHOLD:
             target = max(MIN_DOWNLOAD_WORKERS, DEFAULT_DOWNLOAD_WORKERS // 2)
         elif download_backlog > DEFAULT_DOWNLOAD_WORKERS:
-            target = min(MAX_DOWNLOAD_WORKERS, DEFAULT_DOWNLOAD_WORKERS + download_backlog // 2)
+            target = min(MAX_DOWNLOAD_WORKERS, DEFAULT_DOWNLOAD_WORKERS + download_backlog // 4)
 
         if target != last_limit:
             await _download_limiter.set_limit(target)
@@ -2385,7 +2385,7 @@ async def _queue_upload_job(upload_job: dict) -> None:
     cleanup_payload = upload_job["cleanup_payload"]
     second_caption = upload_job.get("second_caption")
 
-    async def _finalize_upload(**_):
+    async def _finalize_upload(**kwargs):
         if second_caption:
             await safe_send_message(
                 cleanup_payload["client"],
