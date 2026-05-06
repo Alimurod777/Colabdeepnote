@@ -2094,7 +2094,7 @@ async def process_posts(client: Client, message: Message, url: str, fromID: int,
     if status_msg:
         await client.edit_message_text(
             message.chat.id, status_msg.id,
-            f"✅ Tayyor! {processed}/{total} xabar yuklash navbatiga qo'shildi."
+            f"✅ Tayyor! {processed}/{total} xabar yuklash navbatiga qo'shildi — tez orada yuboriladi."
         )
 
 # Handle comment threads
@@ -2185,7 +2185,7 @@ async def handle_comment_thread(client: Client, message: Message, url):
         
         # Update status when complete
         if processed_count > 0:
-            await client.edit_message_text(message.chat.id, status_msg.id, f"Comment thread queued! Processed {processed_count} messages.")
+            await client.edit_message_text(message.chat.id, status_msg.id, f"Comment thread downloaded and queued for upload! Processed {processed_count} messages.")
         else:
             await client.edit_message_text(message.chat.id, status_msg.id, "No messages could be processed from this thread.")
         
@@ -2330,7 +2330,7 @@ async def handle_topic(client: Client, message: Message, url):
         if status_msg:
             try:
                 if processed_count > 0:
-                    await client.edit_message_text(message.chat.id, status_msg.id, f"Topic queued! Processed {processed_count} messages.")
+                    await client.edit_message_text(message.chat.id, status_msg.id, f"Topic downloaded and queued for upload! Processed {processed_count} messages.")
                 else:
                     await client.edit_message_text(message.chat.id, status_msg.id, "No messages could be processed from this topic.")
             except Exception as edit_err:

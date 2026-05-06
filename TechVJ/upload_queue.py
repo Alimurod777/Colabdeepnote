@@ -149,4 +149,4 @@ async def process_upload_queue(max_retries: int = 3) -> None:
     Process upload queue with flood wait handling.
     Run this in background as a task.
     """
-    await _upload_worker("primary", max_retries=max_retries)
+    await _upload_worker(0, max_retries=max_retries)
