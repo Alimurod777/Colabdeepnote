@@ -177,6 +177,8 @@ DOWNLOAD_ADJUST_INTERVAL = 2.0
 download_queue: asyncio.Queue = asyncio.Queue(maxsize=DOWNLOAD_QUEUE_MAXSIZE)
 _download_workers_started = False
 _download_start_lock = asyncio.Lock()
+_download_worker_count = 0
+_next_worker_id = 0
 _acc_lock = asyncio.Lock()
 _acc_pending_counts: dict[int, int] = {}
 _acc_close_requested: dict[int, bool] = {}
@@ -230,12 +232,14 @@ async def _download_limit_controller() -> None:
         elif upload_backlog >= UPLOAD_QUEUE_BACKPRESSURE_THRESHOLD:
             target = max(MIN_DOWNLOAD_WORKERS, DEFAULT_DOWNLOAD_WORKERS // 2)
         elif download_backlog > DEFAULT_DOWNLOAD_WORKERS:
-            target = min(MAX_DOWNLOAD_WORKERS, DEFAULT_DOWNLOAD_WORKERS + download_backlog // 4)
+            target = min(MAX_DOWNLOAD_WORKERS, DEFAULT_DOWNLOAD_WORKERS + min(download_backlog // 4, 50))
 
         if target != last_limit:
             await _download_limiter.set_limit(target)
             last_limit = target
             logger.info(f"[DOWNLOAD] Adaptive workers set to {target} (upload backlog: {upload_backlog})")
+        if target > _download_worker_count:
+            _spawn_download_workers(target - _download_worker_count)
 
         await asyncio.sleep(DOWNLOAD_ADJUST_INTERVAL)
 
@@ -265,10 +269,19 @@ async def ensure_transfer_pipeline() -> None:
         if _download_workers_started:
             return
         start_upload_workers()
-        for idx in range(MAX_DOWNLOAD_WORKERS):
-            asyncio.create_task(_download_worker(idx))
+        _spawn_download_workers(DEFAULT_DOWNLOAD_WORKERS)
         asyncio.create_task(_download_limit_controller())
         _download_workers_started = True
+
+
+def _spawn_download_workers(count: int) -> None:
+    global _download_worker_count, _next_worker_id
+    if count <= 0:
+        return
+    for _ in range(min(count, MAX_DOWNLOAD_WORKERS - _download_worker_count)):
+        asyncio.create_task(_download_worker(_next_worker_id))
+        _next_worker_id += 1
+        _download_worker_count += 1
 
 
 async def queue_download(client: Client, acc, message: Message, chatid: int, msgid: int) -> None:
