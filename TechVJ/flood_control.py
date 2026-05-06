@@ -5,10 +5,14 @@
 import asyncio
 import time
 import logging
+from contextlib import asynccontextmanager
 from typing import Dict
 from pyrogram.errors import FloodWait
 
 logger = logging.getLogger(__name__)
+
+
+UPLOAD_CONCURRENCY_LIMIT = 2
 
 
 class FloodWaitController:
@@ -21,6 +25,7 @@ class FloodWaitController:
         self.user_locks: Dict[int, asyncio.Lock] = {}
         self.user_wait_until: Dict[int, float] = {}
         self.user_retry_delay: Dict[int, float] = {}
+        self.user_upload_semaphores: Dict[int, asyncio.Semaphore] = {}
         
     async def wait_if_needed(self, user_id: int) -> None:
         """Wait if user hit flood limit"""
@@ -42,6 +47,22 @@ class FloodWaitController:
         if user_id not in self.user_locks:
             self.user_locks[user_id] = asyncio.Lock()
         return self.user_locks[user_id]
+
+    def get_upload_semaphore(self, user_id: int) -> asyncio.Semaphore:
+        """Get or create upload semaphore for user"""
+        if user_id not in self.user_upload_semaphores:
+            self.user_upload_semaphores[user_id] = asyncio.Semaphore(UPLOAD_CONCURRENCY_LIMIT)
+        return self.user_upload_semaphores[user_id]
+
+    @asynccontextmanager
+    async def upload_slot(self, user_id: int):
+        """Acquire and release an upload slot for a user."""
+        semaphore = self.get_upload_semaphore(user_id)
+        await semaphore.acquire()
+        try:
+            yield
+        finally:
+            semaphore.release()
     
     async def acquire(self, user_id: int) -> None:
         """Acquire lock and check flood wait"""

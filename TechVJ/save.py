@@ -159,6 +159,10 @@ def get_ffmpeg():
 TWO_GB = 2 * 1024 * 1024 * 1024  # 2GB bytes
 FOUR_GB = 4 * 1024 * 1024 * 1024  # 4GB bytes
 MAX_SAFE_EXT_LENGTH = 10
+FLOOD_WAIT_BUFFER_SECONDS = 2
+UPLOAD_THROTTLE_MIN_BYTES = 100 * 1024 * 1024
+UPLOAD_CHUNK_THROTTLE_BYTES = 4 * 1024 * 1024
+UPLOAD_CHUNK_THROTTLE_DELAY = 0.15
 
 
 async def split_file(file_path: str, chunk_size_bytes: int = TWO_GB) -> list:
@@ -474,317 +478,325 @@ async def upload_via_user_session(
             await safe_send_message(bot, user_id, f"**Ulanish xatosi:** `{conn_err}`")
             return False
 
-        # ── Helper: bitta partni yuborish (DRY) + Flood Protection ──
-        async def _do_send_part(part_path, part_caption, part_idx, total_parts):
-            """Bitta part ni uclient orqali yuboradi. True/False qaytaradi."""
+        async with flood_controller.upload_slot(user_id):
+            # ── Helper: bitta partni yuborish (DRY) + Flood Protection ──
+            async def _do_send_part(part_path, part_caption, part_idx, total_parts):
+                """Bitta part ni uclient orqali yuboradi. True/False qaytaradi."""
 
-            # Upload progress uchun callback — RAMga yozadi
-            def _up_progress(current, total):
-                if progress_msg:
-                    write_progress(f"{progress_msg.id}_up", current, total)
+                throttle_state = {"last_throttle": 0}
 
-            # Exponential backoff: 10s, 20s, 40s, 60s, 120s
-            RETRY_DELAYS = [10, 20, 40, 60, 120]
-            MAX_UPLOAD_RETRIES = len(RETRY_DELAYS)
-
-            for attempt in range(MAX_UPLOAD_RETRIES):
-                try:
-                    # Flood wait tekshiruvi
-                    await flood_controller.wait_if_needed(user_id)
-
-                    # Upload orasida connection tekshiruvi
-                    if not uclient.is_connected:
-                        logger.warning(f"User {user_id}: uclient disconnected before upload attempt {attempt+1}, reconnecting...")
-                        try:
-                            await uclient.connect()
-                            uclient.me = await uclient.get_me()
-                        except Exception as rc_err:
-                            logger.error(f"User {user_id}: reconnect failed: {rc_err}")
-                            if attempt < MAX_UPLOAD_RETRIES - 1:
-                                await asyncio.sleep(RETRY_DELAYS[attempt])
-                                continue
-                            raise
-
-                    # BytesIO qayta urinishda pointer oxirida qolib ketmasligi uchun
-                    if isinstance(part_path, io.BytesIO):
-                        part_path.seek(0)
-
-                    if msg_type == "Video":
-                        await uclient.send_video(
-                            chat_id=chat_id, video=part_path,
-                            caption=part_caption,
-                            duration=extra.get("duration") or 0,
-                            width=extra.get("width") or 0,
-                            height=extra.get("height") or 0, thumb=thumb,
-                            supports_streaming=True,
-                            progress=_up_progress,
-                        )
-                    elif msg_type == "Audio":
-                        await uclient.send_audio(
-                            chat_id=chat_id, audio=part_path,
-                            caption=part_caption,
-                            duration=extra.get("duration") or 0,
-                            performer=extra.get("performer"),
-                            title=extra.get("title"), thumb=thumb,
-                            progress=_up_progress,
-                        )
-                    elif msg_type == "Voice":
-                        await uclient.send_voice(
-                            chat_id=chat_id, voice=part_path,
-                            caption=part_caption,
-                            duration=extra.get("duration") or 0,
-                            progress=_up_progress,
-                        )
-                    elif msg_type == "Photo":
-                        await uclient.send_photo(
-                            chat_id=chat_id, photo=part_path,
-                            caption=part_caption,
-                            progress=_up_progress,
-                        )
-                    elif msg_type == "Animation":
-                        await uclient.send_animation(
-                            chat_id=chat_id, animation=part_path,
-                            caption=part_caption,
-                            progress=_up_progress,
-                        )
-                    elif msg_type == "VideoNote":
-                        await uclient.send_video_note(
-                            chat_id=chat_id, video_note=part_path,
-                            duration=extra.get("duration") or 0,
-                            length=extra.get("length") or 0,
-                            progress=_up_progress,
-                        )
-                    elif msg_type == "Sticker":
-                        await uclient.send_sticker(
-                            chat_id=chat_id, sticker=part_path,
-                            progress=_up_progress,
-                        )
-                    else:
-                        # TUZATISH: DOCUMENT_INVALID — force_document=True bo'lishi kerak
-                        await uclient.send_document(
-                            chat_id=chat_id, document=part_path,
-                            caption=part_caption, thumb=thumb,
-                            force_document=True,
-                            progress=_up_progress,
-                        )
-                    return True
-                except FloodWait as e:
-                    wait = e.value
-                    # Flood controller'ga xabar berish
-                    await flood_controller.handle_flood_wait(user_id, wait)
-
+                # Upload progress uchun callback — RAMga yozadi
+                async def _up_progress(current, total):
                     if progress_msg:
-                        try:
-                            if total_parts > 1:
-                                await progress_msg.edit(
-                                    f"⏳ **Part {part_idx+1}/{total_parts}** — FloodWait: {wait}s kutilmoqda..."
-                                )
-                            else:
-                                await progress_msg.edit(
-                                    f"⏳ **FloodWait:** {wait} soniya kutilmoqda..."
-                                )
-                        except Exception:
-                            pass
-                    await asyncio.sleep(wait)
-                except (ConnectionError, OSError, TimeoutError) as send_err:
-                    # TCP/Network xatolar — exponential backoff bilan retry
-                    delay = RETRY_DELAYS[attempt]
-                    logger.warning(
-                        f"User {user_id}: Upload attempt {attempt+1}/{MAX_UPLOAD_RETRIES} failed: "
-                        f"{type(send_err).__name__}: {send_err}. Retrying in {delay}s..."
-                    )
-                    if progress_msg:
-                        try:
-                            await progress_msg.edit(
-                                f"⚠️ **Upload xatosi** (urinish {attempt+1}/{MAX_UPLOAD_RETRIES}): "
-                                f"`{type(send_err).__name__}`\n"
-                                f"⏳ {delay}s dan keyin qayta uriniladi..."
-                            )
-                        except Exception:
-                            pass
+                        write_progress(f"{progress_msg.id}_up", current, total)
+                    if total and total >= UPLOAD_THROTTLE_MIN_BYTES:
+                        if current - throttle_state["last_throttle"] >= UPLOAD_CHUNK_THROTTLE_BYTES:
+                            throttle_state["last_throttle"] = current
+                            await asyncio.sleep(UPLOAD_CHUNK_THROTTLE_DELAY)
 
-                    if attempt < MAX_UPLOAD_RETRIES - 1:
-                        await asyncio.sleep(delay)
-                        # Reconnect attempt
-                        try:
-                            if not uclient.is_connected:
+                # Exponential backoff: 10s, 20s, 40s, 60s, 120s
+                RETRY_DELAYS = [10, 20, 40, 60, 120]
+                MAX_UPLOAD_RETRIES = len(RETRY_DELAYS)
+
+                for attempt in range(MAX_UPLOAD_RETRIES):
+                    try:
+                        # Flood wait tekshiruvi
+                        await flood_controller.wait_if_needed(user_id)
+
+                        # Upload orasida connection tekshiruvi
+                        if not uclient.is_connected:
+                            logger.warning(f"User {user_id}: uclient disconnected before upload attempt {attempt+1}, reconnecting...")
+                            try:
                                 await uclient.connect()
                                 uclient.me = await uclient.get_me()
-                                logger.info(f"User {user_id}: reconnected after upload error")
-                        except Exception as rc_err:
-                            logger.error(f"User {user_id}: reconnect after upload error failed: {rc_err}")
-                        continue
-                    # Max urinishlar tugadi
-                    logger.error(f"User {user_id}: Upload failed after {MAX_UPLOAD_RETRIES} attempts")
-                    await safe_send_message(
-                        bot, user_id,
-                        f"❌ **Upload muvaffaqiyatsiz** ({MAX_UPLOAD_RETRIES} urinishdan keyin).\n"
-                        f"Xato: `{type(send_err).__name__}: {send_err}`"
-                    )
-                    raise
-                except RuntimeError as send_err:
-                    # "unable to perform operation on <TCPTransport closed=True>"
-                    error_str = str(send_err).lower()
-                    if "closed" in error_str or "transport" in error_str:
+                            except Exception as rc_err:
+                                logger.error(f"User {user_id}: reconnect failed: {rc_err}")
+                                if attempt < MAX_UPLOAD_RETRIES - 1:
+                                    await asyncio.sleep(RETRY_DELAYS[attempt])
+                                    continue
+                                raise
+
+                        # BytesIO qayta urinishda pointer oxirida qolib ketmasligi uchun
+                        if isinstance(part_path, io.BytesIO):
+                            part_path.seek(0)
+
+                        if msg_type == "Video":
+                            await uclient.send_video(
+                                chat_id=chat_id, video=part_path,
+                                caption=part_caption,
+                                duration=extra.get("duration") or 0,
+                                width=extra.get("width") or 0,
+                                height=extra.get("height") or 0, thumb=thumb,
+                                supports_streaming=True,
+                                progress=_up_progress,
+                            )
+                        elif msg_type == "Audio":
+                            await uclient.send_audio(
+                                chat_id=chat_id, audio=part_path,
+                                caption=part_caption,
+                                duration=extra.get("duration") or 0,
+                                performer=extra.get("performer"),
+                                title=extra.get("title"), thumb=thumb,
+                                progress=_up_progress,
+                            )
+                        elif msg_type == "Voice":
+                            await uclient.send_voice(
+                                chat_id=chat_id, voice=part_path,
+                                caption=part_caption,
+                                duration=extra.get("duration") or 0,
+                                progress=_up_progress,
+                            )
+                        elif msg_type == "Photo":
+                            await uclient.send_photo(
+                                chat_id=chat_id, photo=part_path,
+                                caption=part_caption,
+                                progress=_up_progress,
+                            )
+                        elif msg_type == "Animation":
+                            await uclient.send_animation(
+                                chat_id=chat_id, animation=part_path,
+                                caption=part_caption,
+                                progress=_up_progress,
+                            )
+                        elif msg_type == "VideoNote":
+                            await uclient.send_video_note(
+                                chat_id=chat_id, video_note=part_path,
+                                duration=extra.get("duration") or 0,
+                                length=extra.get("length") or 0,
+                                progress=_up_progress,
+                            )
+                        elif msg_type == "Sticker":
+                            await uclient.send_sticker(
+                                chat_id=chat_id, sticker=part_path,
+                                progress=_up_progress,
+                            )
+                        else:
+                            # TUZATISH: DOCUMENT_INVALID — force_document=True bo'lishi kerak
+                            await uclient.send_document(
+                                chat_id=chat_id, document=part_path,
+                                caption=part_caption, thumb=thumb,
+                                force_document=True,
+                                progress=_up_progress,
+                            )
+                        return True
+                    except FloodWait as e:
+                        wait = getattr(e, "value", None) or getattr(e, "x", 0) or 0
+                        wait_with_buffer = wait + FLOOD_WAIT_BUFFER_SECONDS
+                        # Flood controller'ga xabar berish
+                        await flood_controller.handle_flood_wait(user_id, wait_with_buffer)
+
+                        if progress_msg:
+                            try:
+                                if total_parts > 1:
+                                    await progress_msg.edit(
+                                        f"⏳ **Part {part_idx+1}/{total_parts}** — FloodWait: {wait_with_buffer}s kutilmoqda..."
+                                    )
+                                else:
+                                    await progress_msg.edit(
+                                        f"⏳ **FloodWait:** {wait_with_buffer} soniya kutilmoqda..."
+                                    )
+                            except Exception:
+                                pass
+                        await asyncio.sleep(wait_with_buffer)
+                    except (ConnectionError, OSError, TimeoutError) as send_err:
+                        # TCP/Network xatolar — exponential backoff bilan retry
                         delay = RETRY_DELAYS[attempt]
                         logger.warning(
-                            f"User {user_id}: TCPTransport closed, attempt {attempt+1}/{MAX_UPLOAD_RETRIES}. "
-                            f"Retrying in {delay}s..."
+                            f"User {user_id}: Upload attempt {attempt+1}/{MAX_UPLOAD_RETRIES} failed: "
+                            f"{type(send_err).__name__}: {send_err}. Retrying in {delay}s..."
                         )
                         if progress_msg:
                             try:
                                 await progress_msg.edit(
-                                    f"⚠️ **Ulanish uzildi** (urinish {attempt+1}/{MAX_UPLOAD_RETRIES})\n"
-                                    f"⏳ {delay}s dan keyin qayta ulaniladi..."
+                                    f"⚠️ **Upload xatosi** (urinish {attempt+1}/{MAX_UPLOAD_RETRIES}): "
+                                    f"`{type(send_err).__name__}`\n"
+                                    f"⏳ {delay}s dan keyin qayta uriniladi..."
                                 )
                             except Exception:
                                 pass
+
                         if attempt < MAX_UPLOAD_RETRIES - 1:
                             await asyncio.sleep(delay)
+                            # Reconnect attempt
                             try:
-                                await uclient.connect()
-                                uclient.me = await uclient.get_me()
-                                logger.info(f"User {user_id}: reconnected after TCPTransport close")
+                                if not uclient.is_connected:
+                                    await uclient.connect()
+                                    uclient.me = await uclient.get_me()
+                                    logger.info(f"User {user_id}: reconnected after upload error")
                             except Exception as rc_err:
-                                logger.error(f"User {user_id}: reconnect failed: {rc_err}")
+                                logger.error(f"User {user_id}: reconnect after upload error failed: {rc_err}")
                             continue
-                        logger.error(f"User {user_id}: Upload failed — TCPTransport repeatedly closed")
+                        # Max urinishlar tugadi
+                        logger.error(f"User {user_id}: Upload failed after {MAX_UPLOAD_RETRIES} attempts")
                         await safe_send_message(
                             bot, user_id,
-                            f"❌ **Upload muvaffaqiyatsiz** — ulanish barqaror emas.\n"
-                            f"Iltimos biroz kutib qayta urinib ko'ring."
+                            f"❌ **Upload muvaffaqiyatsiz** ({MAX_UPLOAD_RETRIES} urinishdan keyin).\n"
+                            f"Xato: `{type(send_err).__name__}: {send_err}`"
                         )
                         raise
-                    else:
-                        raise
-                except Exception as send_err:
-                    err_str = str(send_err).lower()
-                    # TUZATISH: FILE_PART_INVALID — upload media session buzilgan bo'lishi mumkin
-                    if "file_part_invalid" in err_str:
-                        logger.warning(
-                            f"User {user_id}: FILE_PART_INVALID on upload (attempt {attempt+1}/{MAX_UPLOAD_RETRIES})"
-                        )
-                        if attempt < MAX_UPLOAD_RETRIES - 1:
-                            try:
-                                if uclient.is_connected:
-                                    await uclient.disconnect()
-                            except Exception:
-                                pass
-                            try:
-                                await asyncio.sleep(1)
-                                await uclient.connect()
-                                uclient.me = await uclient.get_me()
+                    except RuntimeError as send_err:
+                        # "unable to perform operation on <TCPTransport closed=True>"
+                        error_str = str(send_err).lower()
+                        if "closed" in error_str or "transport" in error_str:
+                            delay = RETRY_DELAYS[attempt]
+                            logger.warning(
+                                f"User {user_id}: TCPTransport closed, attempt {attempt+1}/{MAX_UPLOAD_RETRIES}. "
+                                f"Retrying in {delay}s..."
+                            )
+                            if progress_msg:
+                                try:
+                                    await progress_msg.edit(
+                                        f"⚠️ **Ulanish uzildi** (urinish {attempt+1}/{MAX_UPLOAD_RETRIES})\n"
+                                        f"⏳ {delay}s dan keyin qayta ulaniladi..."
+                                    )
+                                except Exception:
+                                    pass
+                            if attempt < MAX_UPLOAD_RETRIES - 1:
+                                await asyncio.sleep(delay)
+                                try:
+                                    await uclient.connect()
+                                    uclient.me = await uclient.get_me()
+                                    logger.info(f"User {user_id}: reconnected after TCPTransport close")
+                                except Exception as rc_err:
+                                    logger.error(f"User {user_id}: reconnect failed: {rc_err}")
+                                continue
+                            logger.error(f"User {user_id}: Upload failed — TCPTransport repeatedly closed")
+                            await safe_send_message(
+                                bot, user_id,
+                                f"❌ **Upload muvaffaqiyatsiz** — ulanish barqaror emas.\n"
+                                f"Iltimos biroz kutib qayta urinib ko'ring."
+                            )
+                            raise
+                        else:
+                            raise
+                    except Exception as send_err:
+                        err_str = str(send_err).lower()
+                        # TUZATISH: FILE_PART_INVALID — upload media session buzilgan bo'lishi mumkin
+                        if "file_part_invalid" in err_str:
+                            logger.warning(
+                                f"User {user_id}: FILE_PART_INVALID on upload (attempt {attempt+1}/{MAX_UPLOAD_RETRIES})"
+                            )
+                            if attempt < MAX_UPLOAD_RETRIES - 1:
+                                try:
+                                    if uclient.is_connected:
+                                        await uclient.disconnect()
+                                except Exception:
+                                    pass
+                                try:
+                                    await asyncio.sleep(1)
+                                    await uclient.connect()
+                                    uclient.me = await uclient.get_me()
+                                    await _resolve_bot_peer(uclient, chat_id)
+                                except Exception as rc_err:
+                                    logger.error(f"User {user_id}: reconnect after FILE_PART_INVALID failed: {rc_err}")
+                                await asyncio.sleep(RETRY_DELAYS[attempt])
+                                continue
+                            await safe_send_message(
+                                bot, user_id,
+                                "❌ **Upload xatosi:** `FILE_PART_INVALID`.\n"
+                                "Iltimos qayta urinib ko'ring."
+                            )
+                            raise
+
+                        # TUZATISH: PEER_ID_INVALID — bot peer keshdan tushib ketgan
+                        if "peer_id_invalid" in err_str or "peer id" in err_str:
+                            logger.warning(f"User {user_id}: PEER_ID_INVALID — re-resolving bot peer (attempt {attempt+1})")
+                            if attempt < MAX_UPLOAD_RETRIES - 1:
+                                # Bot peer'ni qayta resolve qilish
                                 await _resolve_bot_peer(uclient, chat_id)
-                            except Exception as rc_err:
-                                logger.error(f"User {user_id}: reconnect after FILE_PART_INVALID failed: {rc_err}")
-                            await asyncio.sleep(RETRY_DELAYS[attempt])
-                            continue
-                        await safe_send_message(
-                            bot, user_id,
-                            "❌ **Upload xatosi:** `FILE_PART_INVALID`.\n"
-                            "Iltimos qayta urinib ko'ring."
-                        )
+                                await asyncio.sleep(RETRY_DELAYS[attempt])
+                                continue
+                            await safe_send_message(
+                                bot, user_id,
+                                "❌ **Upload xatosi:** Bot peer topilmadi.\n"
+                                "Iltimos botga /start yuboring va qayta urinib ko'ring."
+                            )
+                            raise
+                        # TUZATISH: DOCUMENT_INVALID — fayl noto'g'ri
+                        if "document_invalid" in err_str:
+                            logger.error(f"User {user_id}: DOCUMENT_INVALID for {msg_type}")
+                            await safe_send_message(
+                                bot, user_id,
+                                f"❌ **Upload xatosi:** Fayl noto'g'ri formatda (`DOCUMENT_INVALID`).\n"
+                                f"Fayl buzilgan yoki bo'sh bo'lishi mumkin."
+                            )
+                            raise
+                        logger.error(f"[UPLOAD] unexpected error attempt={attempt}: {type(send_err).__name__}: {send_err}")
+                        import traceback
+                        traceback.print_exc()
                         raise
+                return False
 
-                    # TUZATISH: PEER_ID_INVALID — bot peer keshdan tushib ketgan
-                    if "peer_id_invalid" in err_str or "peer id" in err_str:
-                        logger.warning(f"User {user_id}: PEER_ID_INVALID — re-resolving bot peer (attempt {attempt+1})")
-                        if attempt < MAX_UPLOAD_RETRIES - 1:
-                            # Bot peer'ni qayta resolve qilish
-                            await _resolve_bot_peer(uclient, chat_id)
-                            await asyncio.sleep(RETRY_DELAYS[attempt])
-                            continue
-                        await safe_send_message(
-                            bot, user_id,
-                            "❌ **Upload xatosi:** Bot peer topilmadi.\n"
-                            "Iltimos botga /start yuboring va qayta urinib ko'ring."
-                        )
-                        raise
-                    # TUZATISH: DOCUMENT_INVALID — fayl noto'g'ri
-                    if "document_invalid" in err_str:
-                        logger.error(f"User {user_id}: DOCUMENT_INVALID for {msg_type}")
-                        await safe_send_message(
-                            bot, user_id,
-                            f"❌ **Upload xatosi:** Fayl noto'g'ri formatda (`DOCUMENT_INVALID`).\n"
-                            f"Fayl buzilgan yoki bo'sh bo'lishi mumkin."
-                        )
-                        raise
-                    logger.error(f"[UPLOAD] unexpected error attempt={attempt}: {type(send_err).__name__}: {send_err}")
-                    import traceback
-                    traceback.print_exc()
-                    raise
-            return False
+            # ── Helper: barcha partlarni yuborish (DRY) ──
+            async def _upload_parts(parts_list):
+                """parts_list dagi har bir partni upload qiladi. (ok, err) qaytaradi."""
+                for idx, p_path in enumerate(parts_list):
+                    p_caption = caption
+                    if len(parts_list) > 1:
+                        p_caption = f"{caption}\n**Part {idx+1}/{len(parts_list)}**"
 
-        # ── Helper: barcha partlarni yuborish (DRY) ──
-        async def _upload_parts(parts_list):
-            """parts_list dagi har bir partni upload qiladi. (ok, err) qaytaradi."""
-            for idx, p_path in enumerate(parts_list):
-                p_caption = caption
-                if len(parts_list) > 1:
-                    p_caption = f"{caption}\n**Part {idx+1}/{len(parts_list)}**"
+                    if len(parts_list) > 1 and progress_msg:
+                        try:
+                            await progress_msg.edit(f"📤 **Part {idx+1}/{len(parts_list)}** yuklanmoqda...")
+                        except Exception:
+                            pass
 
-                if len(parts_list) > 1 and progress_msg:
+                    uploaded = False
                     try:
-                        await progress_msg.edit(f"📤 **Part {idx+1}/{len(parts_list)}** yuklanmoqda...")
-                    except Exception:
-                        pass
+                        uploaded = await _do_send_part(p_path, p_caption, idx, len(parts_list))
+                    except Exception as err:
+                        return False, err
+                    if not uploaded:
+                        return False, None
+                    # Minimal delay between parts to prevent flood
+                    if idx < len(parts_list) - 1:
+                        await asyncio.sleep(2)
+                return True, None
 
-                uploaded = False
-                try:
-                    uploaded = await _do_send_part(p_path, p_caption, idx, len(parts_list))
-                except Exception as err:
-                    return False, err
-                if not uploaded:
-                    return False, None
-                # Minimal delay between parts to prevent flood
-                if idx < len(parts_list) - 1:
-                    await asyncio.sleep(2)
-            return True, None
+            # ── Primary upload ──
+            ok, err = await _upload_parts(parts)
 
-        # ── Primary upload ──
-        ok, err = await _upload_parts(parts)
-
-        if not ok and err is not None:
-            # Exception bo'ldi
-            if is_premium and file_size > TWO_GB and len(parts) == 1:
-                # Premium fallback: split qilib qayta urinish
-                if progress_msg:
-                    try:
-                        await progress_msg.edit(
-                            "⚠️ **Splitiz upload muvaffaqiyatsiz. Split bilan qayta urinilmoqda...**"
-                        )
-                    except Exception:
-                        pass
-                parts = await split_file(file_path, TWO_GB)
-                parts_to_cleanup = [p for p in parts if isinstance(p, str) and p != file_path]
-                ok, err = await _upload_parts(parts)
-                if not ok:
-                    if err is not None:
-                        await safe_send_message(bot, user_id, f"**Upload xatosi:** `{err}`")
-                    else:
-                        await safe_send_message(bot, user_id, "**Upload: FloodWait — maksimal urinishlar tugadi.**")
+            if not ok and err is not None:
+                # Exception bo'ldi
+                if is_premium and file_size > TWO_GB and len(parts) == 1:
+                    # Premium fallback: split qilib qayta urinish
+                    if progress_msg:
+                        try:
+                            await progress_msg.edit(
+                                "⚠️ **Splitiz upload muvaffaqiyatsiz. Split bilan qayta urinilmoqda...**"
+                            )
+                        except Exception:
+                            pass
+                    parts = await split_file(file_path, TWO_GB)
+                    parts_to_cleanup = [p for p in parts if isinstance(p, str) and p != file_path]
+                    ok, err = await _upload_parts(parts)
+                    if not ok:
+                        if err is not None:
+                            await safe_send_message(bot, user_id, f"**Upload xatosi:** `{err}`")
+                        else:
+                            await safe_send_message(bot, user_id, "**Upload: FloodWait — maksimal urinishlar tugadi.**")
+                        success = False
+                else:
+                    await safe_send_message(bot, user_id, f"**Upload xatosi:** `{err}`")
                     success = False
-            else:
-                await safe_send_message(bot, user_id, f"**Upload xatosi:** `{err}`")
+            elif not ok:
+                # FloodWait tugadi (exception yo'q)
+                await safe_send_message(bot, user_id, "**Upload: FloodWait — maksimal urinishlar tugadi.**")
                 success = False
-        elif not ok:
-            # FloodWait tugadi (exception yo'q)
-            await safe_send_message(bot, user_id, "**Upload: FloodWait — maksimal urinishlar tugadi.**")
-            success = False
 
-        # ── Multi-part muvaffaqiyat xabari ──
-        if success and len(parts) > 1 and progress_msg:
-            try:
-                await progress_msg.edit(f"✅ **{len(parts)} ta part muvaffaqiyatli yuklandi!**")
-            except Exception:
-                pass
+            # ── Multi-part muvaffaqiyat xabari ──
+            if success and len(parts) > 1 and progress_msg:
+                try:
+                    await progress_msg.edit(f"✅ **{len(parts)} ta part muvaffaqiyatli yuklandi!**")
+                except Exception:
+                    pass
 
-        # Split qilingan temp fayllarni tozalash
-        for part_path in parts_to_cleanup:
-            try:
-                os.remove(part_path)
-            except Exception:
-                pass
+            # Split qilingan temp fayllarni tozalash
+            for part_path in parts_to_cleanup:
+                try:
+                    os.remove(part_path)
+                except Exception:
+                    pass
 
     finally:
         # Faqat o'zimiz yaratgan clientni disconnect qilamiz
