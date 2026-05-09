@@ -10,6 +10,8 @@ import glob
 import base64
 import time
 import logging
+from pathlib import Path
+from typing import Awaitable, Callable, Optional, Union
 import qrcode
 from pyrogram.types import Message
 from pyrogram import Client, filters, raw
@@ -36,11 +38,19 @@ QR_LOGIN_TIMEOUT = 180
 QR_POLL_INTERVAL = 2
 QR_TOKEN_REFRESH_MARGIN = 5
 ACTIVE_QR_USERS = set()
-ACTIVE_QR_LOCK = asyncio.Lock()
+ACTIVE_QR_LOCK: Optional[asyncio.Lock] = None
+LoginTokenResult = Union[raw.types.auth.LoginToken, raw.types.auth.LoginTokenSuccess]
+
+
+def _get_qr_lock() -> asyncio.Lock:
+    global ACTIVE_QR_LOCK
+    if ACTIVE_QR_LOCK is None:
+        ACTIVE_QR_LOCK = asyncio.Lock()
+    return ACTIVE_QR_LOCK
 
 
 async def _mark_qr_active(user_id: int) -> bool:
-    async with ACTIVE_QR_LOCK:
+    async with _get_qr_lock():
         if user_id in ACTIVE_QR_USERS:
             return False
         ACTIVE_QR_USERS.add(user_id)
@@ -48,7 +58,7 @@ async def _mark_qr_active(user_id: int) -> bool:
 
 
 async def _clear_qr_active(user_id: int) -> None:
-    async with ACTIVE_QR_LOCK:
+    async with _get_qr_lock():
         ACTIVE_QR_USERS.discard(user_id)
 
 
@@ -70,8 +80,13 @@ def _build_qr_bytes(url: str) -> io.BytesIO:
 
 async def _cleanup_session_files(session_path: str) -> None:
     try:
-        for f in glob.glob(f"{session_path}*"):
-            os.remove(f)
+        base_dir = Path("sessions").resolve()
+        session_prefix = Path(session_path).resolve()
+        if base_dir not in session_prefix.parents and session_prefix != base_dir:
+            return
+        for f in session_prefix.parent.glob(f"{session_prefix.name}*"):
+            if f.is_file():
+                f.unlink()
     except Exception:
         pass
 
@@ -106,7 +121,7 @@ async def _switch_dc(client: Client, dc_id: int) -> None:
     await _safe_reconnect(client)
 
 
-async def _export_login_token(client: Client):
+async def _export_login_token(client: Client) -> LoginTokenResult:
     try:
         result = await client.invoke(
             raw.functions.auth.ExportLoginToken(
@@ -137,7 +152,7 @@ async def _export_login_token(client: Client):
     return result
 
 
-async def _import_login_token(client: Client, token: bytes):
+async def _import_login_token(client: Client, token: bytes) -> LoginTokenResult:
     try:
         result = await client.invoke(raw.functions.auth.ImportLoginToken(token=token))
     except (OSError, ConnectionError):
@@ -153,14 +168,14 @@ async def _import_login_token(client: Client, token: bytes):
 async def _wait_for_qr_login(
     client: Client,
     initial_token: raw.types.auth.LoginToken,
-    update_qr_callback,
-):
+    update_qr_callback: Callable[[raw.types.auth.LoginToken], Awaitable[None]],
+) -> raw.types.auth.LoginTokenSuccess:
     login_token = initial_token
-    deadline = time.monotonic() + QR_LOGIN_TIMEOUT
+    deadline = time.time() + QR_LOGIN_TIMEOUT
 
     while True:
-        if time.monotonic() >= deadline:
-            raise TimeoutError
+        if time.time() >= deadline:
+            raise TimeoutError("QR login timeout exceeded")
 
         if login_token.expires and time.time() >= (login_token.expires - QR_TOKEN_REFRESH_MARGIN):
             login_token = await _export_login_token(client)
@@ -368,7 +383,7 @@ async def qr_login(bot: Client, message: Message):
 
         login_token = await _export_login_token(client)
 
-        async def update_qr(login_token):
+        async def update_qr(login_token: raw.types.auth.LoginToken):
             nonlocal qr_msg
             buf = _build_qr_bytes(_qr_login_url(login_token.token))
             try:
