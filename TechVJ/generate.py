@@ -155,26 +155,26 @@ async def _wait_for_qr_login(
     initial_token: raw.types.auth.LoginToken,
     update_qr_callback,
 ):
-    token_obj = initial_token
+    login_token = initial_token
     deadline = time.monotonic() + QR_LOGIN_TIMEOUT
 
     while True:
         if time.monotonic() >= deadline:
-            raise asyncio.TimeoutError
+            raise TimeoutError
 
-        if token_obj.expires and time.time() >= (token_obj.expires - QR_TOKEN_REFRESH_MARGIN):
-            token_obj = await _export_login_token(client)
-            if isinstance(token_obj, raw.types.auth.LoginTokenSuccess):
-                return token_obj
-            await update_qr_callback(token_obj)
+        if login_token.expires and time.time() >= (login_token.expires - QR_TOKEN_REFRESH_MARGIN):
+            login_token = await _export_login_token(client)
+            if isinstance(login_token, raw.types.auth.LoginTokenSuccess):
+                return login_token
+            await update_qr_callback(login_token)
 
         try:
-            result = await _import_login_token(client, token_obj.token)
+            result = await _import_login_token(client, login_token.token)
         except AuthTokenException:
-            token_obj = await _export_login_token(client)
-            if isinstance(token_obj, raw.types.auth.LoginTokenSuccess):
-                return token_obj
-            await update_qr_callback(token_obj)
+            login_token = await _export_login_token(client)
+            if isinstance(login_token, raw.types.auth.LoginTokenSuccess):
+                return login_token
+            await update_qr_callback(login_token)
             await asyncio.sleep(QR_POLL_INTERVAL)
             continue
 
@@ -182,11 +182,11 @@ async def _wait_for_qr_login(
             return result
 
         if isinstance(result, raw.types.auth.LoginToken):
-            if result.token != token_obj.token:
-                token_obj = result
-                await update_qr_callback(token_obj)
+            if result.token != login_token.token:
+                login_token = result
+                await update_qr_callback(login_token)
             else:
-                token_obj = result
+                login_token = result
 
         await asyncio.sleep(QR_POLL_INTERVAL)
 
@@ -368,9 +368,9 @@ async def qr_login(bot: Client, message: Message):
 
         login_token = await _export_login_token(client)
 
-        async def update_qr(token_obj):
+        async def update_qr(login_token):
             nonlocal qr_msg
-            buf = _build_qr_bytes(_qr_login_url(token_obj.token))
+            buf = _build_qr_bytes(_qr_login_url(login_token.token))
             try:
                 await status_msg.delete()
             except Exception:
