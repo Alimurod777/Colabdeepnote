@@ -82,7 +82,7 @@ async def _cleanup_session_files(session_path: str) -> None:
     try:
         base_dir = Path("sessions").resolve()
         session_prefix = Path(session_path).resolve()
-        if base_dir not in session_prefix.parents and session_prefix != base_dir:
+        if session_prefix.parent != base_dir:
             return
         for f in session_prefix.parent.glob(f"{session_prefix.name}*"):
             if f.is_file():
@@ -93,7 +93,7 @@ async def _cleanup_session_files(session_path: str) -> None:
 
 async def _safe_reconnect(client: Client) -> None:
     try:
-        if getattr(client, "is_connected", False):
+        if hasattr(client, "is_connected") and client.is_connected:
             await client.disconnect()
     except Exception:
         pass
@@ -105,7 +105,7 @@ async def _switch_dc(client: Client, dc_id: int) -> None:
     if current_dc == dc_id:
         return
     try:
-        if getattr(client, "is_connected", False):
+        if hasattr(client, "is_connected") and client.is_connected:
             await client.disconnect()
     except Exception:
         pass
@@ -177,7 +177,7 @@ async def _wait_for_qr_login(
         if time.time() >= deadline:
             raise TimeoutError("QR login timeout exceeded")
 
-        if login_token.expires and time.time() >= (login_token.expires - QR_TOKEN_REFRESH_MARGIN):
+        if login_token.expires and login_token.expires > 0 and time.time() >= (login_token.expires - QR_TOKEN_REFRESH_MARGIN):
             login_token = await _export_login_token(client)
             if isinstance(login_token, raw.types.auth.LoginTokenSuccess):
                 return login_token
@@ -468,10 +468,10 @@ async def qr_login(bot: Client, message: Message):
             data = {"session": string_session, "logged_in": True, "is_premium": is_premium}
             database.update_one({"chat_id": user_id}, {"$set": data})
             await bot.send_message(user_id, "**QR orqali login muvaffaqiyatli!**\n\nAgar xato chiqsa /logout va /qrlogin ni qayta ishlating.")
-    except PasswordHashInvalid:
-        await bot.send_message(user_id, "**Noto'g'ri parol.**")
-    except Exception:
-        await bot.send_message(user_id, "**2FA jarayonida xato yuz berdi.**")
+        except PasswordHashInvalid:
+            await bot.send_message(user_id, "**Noto'g'ri parol.**")
+        except Exception:
+            await bot.send_message(user_id, "**2FA jarayonida xato yuz berdi.**")
     except asyncio.TimeoutError:
         await bot.send_message(user_id, "**QR kod muddati tugadi. /qrlogin ni qayta yuboring.**")
     except Exception as e:
