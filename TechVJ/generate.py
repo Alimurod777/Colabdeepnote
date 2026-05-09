@@ -11,7 +11,7 @@ import base64
 import time
 import logging
 from pathlib import Path
-from typing import Awaitable, Callable, Optional, Union
+from typing import Awaitable, Callable, Union
 import qrcode
 from pyrogram.types import Message
 from pyrogram import Client, filters, raw
@@ -25,7 +25,9 @@ from pyrogram.errors import (
     PhoneCodeExpired,
     SessionPasswordNeeded,
     PasswordHashInvalid,
-    AuthTokenException,
+    AuthTokenAlreadyAccepted,
+    AuthTokenExpired,
+    AuthTokenInvalid,
 )
 from TechVJ.strings import strings
 from config import API_ID, API_HASH
@@ -38,19 +40,12 @@ QR_LOGIN_TIMEOUT = 180
 QR_POLL_INTERVAL = 2
 QR_TOKEN_REFRESH_MARGIN = 5
 ACTIVE_QR_USERS = set()
-ACTIVE_QR_LOCK: Optional[asyncio.Lock] = None
+ACTIVE_QR_LOCK = asyncio.Lock()
 LoginTokenResult = Union[raw.types.auth.LoginToken, raw.types.auth.LoginTokenSuccess]
 
 
-def _get_qr_lock() -> asyncio.Lock:
-    global ACTIVE_QR_LOCK
-    if ACTIVE_QR_LOCK is None:
-        ACTIVE_QR_LOCK = asyncio.Lock()
-    return ACTIVE_QR_LOCK
-
-
 async def _mark_qr_active(user_id: int) -> bool:
-    async with _get_qr_lock():
+    async with ACTIVE_QR_LOCK:
         if user_id in ACTIVE_QR_USERS:
             return False
         ACTIVE_QR_USERS.add(user_id)
@@ -58,7 +53,7 @@ async def _mark_qr_active(user_id: int) -> bool:
 
 
 async def _clear_qr_active(user_id: int) -> None:
-    async with _get_qr_lock():
+    async with ACTIVE_QR_LOCK:
         ACTIVE_QR_USERS.discard(user_id)
 
 
@@ -102,7 +97,7 @@ async def _safe_reconnect(client: Client) -> None:
 
 async def _switch_dc(client: Client, dc_id: int) -> None:
     current_dc = await client.storage.dc_id()
-    if current_dc == dc_id:
+    if current_dc is not None and current_dc == dc_id:
         return
     try:
         if hasattr(client, "is_connected") and client.is_connected:
@@ -177,7 +172,10 @@ async def _wait_for_qr_login(
         if time.time() >= deadline:
             raise TimeoutError("QR login timeout exceeded")
 
-        if login_token.expires and time.time() >= (login_token.expires - QR_TOKEN_REFRESH_MARGIN):
+        expires_at = login_token.expires
+        if expires_at and expires_at > 10**12:
+            expires_at = expires_at / 1000
+        if expires_at and time.time() >= (expires_at - QR_TOKEN_REFRESH_MARGIN):
             login_token = await _export_login_token(client)
             if isinstance(login_token, raw.types.auth.LoginTokenSuccess):
                 return login_token
@@ -185,7 +183,7 @@ async def _wait_for_qr_login(
 
         try:
             result = await _import_login_token(client, login_token.token)
-        except AuthTokenException:
+        except (AuthTokenAlreadyAccepted, AuthTokenExpired, AuthTokenInvalid):
             login_token = await _export_login_token(client)
             if isinstance(login_token, raw.types.auth.LoginTokenSuccess):
                 return login_token
@@ -472,7 +470,7 @@ async def qr_login(bot: Client, message: Message):
             await bot.send_message(user_id, "**Noto'g'ri parol.**")
         except Exception:
             await bot.send_message(user_id, "**2FA jarayonida xato yuz berdi.**")
-    except asyncio.TimeoutError:
+    except TimeoutError:
         await bot.send_message(user_id, "**QR kod muddati tugadi. /qrlogin ni qayta yuboring.**")
     except Exception as e:
         await bot.send_message(user_id, f"**Xato:** `{e}`")
