@@ -39,6 +39,8 @@ SESSION_STRING_SIZE = 351
 QR_LOGIN_TIMEOUT = 180
 QR_POLL_INTERVAL = 2
 QR_TOKEN_REFRESH_MARGIN = 5
+TOKEN_EXPIRES_MS_THRESHOLD = 10**12
+MS_TO_SECONDS = 1000
 ACTIVE_QR_USERS = set()
 ACTIVE_QR_LOCK = asyncio.Lock()
 LoginTokenResult = Union[raw.types.auth.LoginToken, raw.types.auth.LoginTokenSuccess]
@@ -173,8 +175,8 @@ async def _wait_for_qr_login(
             raise TimeoutError("QR login timeout exceeded")
 
         expires_at = login_token.expires
-        if expires_at and expires_at > 10**12:
-            expires_at = expires_at / 1000
+        if expires_at and expires_at > TOKEN_EXPIRES_MS_THRESHOLD:
+            expires_at = expires_at / MS_TO_SECONDS
         if expires_at and time.time() >= (expires_at - QR_TOKEN_REFRESH_MARGIN):
             login_token = await _export_login_token(client)
             if isinstance(login_token, raw.types.auth.LoginTokenSuccess):
@@ -198,8 +200,6 @@ async def _wait_for_qr_login(
             if result.token != login_token.token:
                 login_token = result
                 await update_qr_callback(login_token)
-            else:
-                login_token = result
 
         await asyncio.sleep(QR_POLL_INTERVAL)
 
