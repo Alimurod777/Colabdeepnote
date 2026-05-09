@@ -177,7 +177,7 @@ async def _wait_for_qr_login(
         if time.time() >= deadline:
             raise TimeoutError("QR login timeout exceeded")
 
-        if login_token.expires and login_token.expires > 0 and time.time() >= (login_token.expires - QR_TOKEN_REFRESH_MARGIN):
+        if login_token.expires and time.time() >= (login_token.expires - QR_TOKEN_REFRESH_MARGIN):
             login_token = await _export_login_token(client)
             if isinstance(login_token, raw.types.auth.LoginTokenSuccess):
                 return login_token
@@ -383,7 +383,7 @@ async def qr_login(bot: Client, message: Message):
 
         login_token = await _export_login_token(client)
 
-        async def update_qr(login_token: raw.types.auth.LoginToken):
+        async def refresh_qr_code(login_token: raw.types.auth.LoginToken):
             nonlocal qr_msg
             buf = _build_qr_bytes(_qr_login_url(login_token.token))
             try:
@@ -413,8 +413,8 @@ async def qr_login(bot: Client, message: Message):
             except Exception:
                 pass
         else:
-            await update_qr(login_token)
-            await _wait_for_qr_login(client, login_token, update_qr)
+            await refresh_qr_code(login_token)
+            await _wait_for_qr_login(client, login_token, refresh_qr_code)
 
         # Export session BEFORE disconnect (inside try block)
         string_session = await client.export_session_string()
