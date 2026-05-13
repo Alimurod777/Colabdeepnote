@@ -7,10 +7,15 @@ import asyncio
 import os
 import io
 import glob
+import base64
+import time
 import logging
+from pathlib import Path
+from typing import Awaitable, Callable, Union
 import qrcode
 from pyrogram.types import Message
-from pyrogram import Client, filters
+from pyrogram import Client, filters, raw
+from pyrogram.session import Auth
 from asyncio.exceptions import TimeoutError
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import (
@@ -19,7 +24,10 @@ from pyrogram.errors import (
     PhoneCodeInvalid,
     PhoneCodeExpired,
     SessionPasswordNeeded,
-    PasswordHashInvalid
+    PasswordHashInvalid,
+    AuthTokenAlreadyAccepted,
+    AuthTokenExpired,
+    AuthTokenInvalid,
 )
 from TechVJ.strings import strings
 from config import API_ID, API_HASH
@@ -28,6 +36,172 @@ from database.db import database
 logger = logging.getLogger(__name__)
 
 SESSION_STRING_SIZE = 351
+QR_LOGIN_TIMEOUT = 180
+QR_POLL_INTERVAL = 2
+QR_TOKEN_REFRESH_MARGIN = 5
+TOKEN_EXPIRES_MS_THRESHOLD = 10**12
+MS_TO_SECONDS = 1000
+ACTIVE_QR_USERS = set()
+ACTIVE_QR_LOCK = asyncio.Lock()
+LoginTokenResult = Union[raw.types.auth.LoginToken, raw.types.auth.LoginTokenSuccess]
+
+
+async def _mark_qr_active(user_id: int) -> bool:
+    async with ACTIVE_QR_LOCK:
+        if user_id in ACTIVE_QR_USERS:
+            return False
+        ACTIVE_QR_USERS.add(user_id)
+        return True
+
+
+async def _clear_qr_active(user_id: int) -> None:
+    async with ACTIVE_QR_LOCK:
+        ACTIVE_QR_USERS.discard(user_id)
+
+
+def _encode_login_token(token: bytes) -> str:
+    return base64.urlsafe_b64encode(token).decode().rstrip("=")
+
+
+def _qr_login_url(token: bytes) -> str:
+    return f"tg://login?token={_encode_login_token(token)}"
+
+
+def _build_qr_bytes(url: str) -> io.BytesIO:
+    qr_img = qrcode.make(url)
+    buf = io.BytesIO()
+    qr_img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+async def _cleanup_session_files(session_path: str) -> None:
+    try:
+        base_dir = Path("sessions").resolve()
+        session_prefix = Path(session_path).resolve()
+        if session_prefix.parent != base_dir:
+            return
+        for f in session_prefix.parent.glob(f"{session_prefix.name}*"):
+            if f.is_file():
+                f.unlink()
+    except Exception:
+        pass
+
+
+async def _safe_reconnect(client: Client) -> None:
+    try:
+        if hasattr(client, "is_connected") and client.is_connected:
+            await client.disconnect()
+    except Exception:
+        pass
+    await client.connect()
+
+
+async def _switch_dc(client: Client, dc_id: int) -> None:
+    current_dc = await client.storage.dc_id()
+    if current_dc is not None and current_dc == dc_id:
+        return
+    try:
+        if hasattr(client, "is_connected") and client.is_connected:
+            await client.disconnect()
+    except Exception:
+        pass
+    if await client.storage.test_mode() is None:
+        await client.storage.test_mode(client.test_mode)
+    if await client.storage.api_id() is None:
+        await client.storage.api_id(API_ID)
+    await client.storage.dc_id(dc_id)
+    await client.storage.auth_key(await Auth(client, dc_id, await client.storage.test_mode()).create())
+    await client.storage.user_id(0)
+    await client.storage.is_bot(False)
+    await client.storage.date(0)
+    await _safe_reconnect(client)
+
+
+async def _export_login_token(client: Client) -> LoginTokenResult:
+    try:
+        result = await client.invoke(
+            raw.functions.auth.ExportLoginToken(
+                api_id=API_ID,
+                api_hash=API_HASH,
+                except_ids=[]
+            )
+        )
+    except (OSError, ConnectionError):
+        await _safe_reconnect(client)
+        result = await client.invoke(
+            raw.functions.auth.ExportLoginToken(
+                api_id=API_ID,
+                api_hash=API_HASH,
+                except_ids=[]
+            )
+        )
+
+    while isinstance(result, raw.types.auth.LoginTokenMigrateTo):
+        await _switch_dc(client, result.dc_id)
+        result = await client.invoke(
+            raw.functions.auth.ExportLoginToken(
+                api_id=API_ID,
+                api_hash=API_HASH,
+                except_ids=[]
+            )
+        )
+    return result
+
+
+async def _import_login_token(client: Client, token: bytes) -> LoginTokenResult:
+    try:
+        result = await client.invoke(raw.functions.auth.ImportLoginToken(token=token))
+    except (OSError, ConnectionError):
+        await _safe_reconnect(client)
+        result = await client.invoke(raw.functions.auth.ImportLoginToken(token=token))
+
+    while isinstance(result, raw.types.auth.LoginTokenMigrateTo):
+        await _switch_dc(client, result.dc_id)
+        result = await client.invoke(raw.functions.auth.ImportLoginToken(token=result.token))
+    return result
+
+
+async def _wait_for_qr_login(
+    client: Client,
+    initial_token: raw.types.auth.LoginToken,
+    update_qr_callback: Callable[[raw.types.auth.LoginToken], Awaitable[None]],
+) -> raw.types.auth.LoginTokenSuccess:
+    login_token = initial_token
+    deadline = time.time() + QR_LOGIN_TIMEOUT
+
+    while True:
+        if time.time() >= deadline:
+            raise TimeoutError("QR login timeout exceeded")
+
+        expires_at = login_token.expires
+        if expires_at and expires_at > TOKEN_EXPIRES_MS_THRESHOLD:
+            expires_at = expires_at / MS_TO_SECONDS
+        if expires_at and time.time() >= (expires_at - QR_TOKEN_REFRESH_MARGIN):
+            login_token = await _export_login_token(client)
+            if isinstance(login_token, raw.types.auth.LoginTokenSuccess):
+                return login_token
+            await update_qr_callback(login_token)
+
+        try:
+            result = await _import_login_token(client, login_token.token)
+        except (AuthTokenAlreadyAccepted, AuthTokenExpired, AuthTokenInvalid):
+            login_token = await _export_login_token(client)
+            if isinstance(login_token, raw.types.auth.LoginTokenSuccess):
+                return login_token
+            await update_qr_callback(login_token)
+            await asyncio.sleep(QR_POLL_INTERVAL)
+            continue
+
+        if isinstance(result, raw.types.auth.LoginTokenSuccess):
+            return result
+
+        if isinstance(result, raw.types.auth.LoginToken):
+            if result.token != login_token.token:
+                login_token = result
+                await update_qr_callback(login_token)
+
+        await asyncio.sleep(QR_POLL_INTERVAL)
 
 def get(obj, key, default=None):
     try:
@@ -190,52 +364,55 @@ async def qr_login(bot: Client, message: Message):
     if user_data and user_data.get("logged_in"):
         await message.reply("**Siz allaqachon login qilgansiz.**\nQayta login uchun avval /logout qiling.")
         return
+    if not await _mark_qr_active(user_id):
+        await message.reply("**QR login jarayoni allaqachon boshlangan.**\nIltimos, avvalgi urinish tugashini kuting.")
+        return
 
     status_msg = await message.reply("**QR kod tayyorlanmoqda...**")
 
     session_path = f"sessions/temp_qr_{user_id}"
     os.makedirs("sessions", exist_ok=True)
+    await _cleanup_session_files(session_path)
     client = Client(session_path, API_ID, API_HASH)
     qr_msg = None
 
     try:
         await client.connect()
 
-        qr_login_obj = await client.qr_login()
+        login_token = await _export_login_token(client)
 
-        qr_img = qrcode.make(qr_login_obj.url)
-        buf = io.BytesIO()
-        qr_img.save(buf, format="PNG")
-        buf.seek(0)
-
-        await status_msg.delete()
-        qr_msg = await bot.send_photo(
-            chat_id=user_id,
-            photo=buf,
-            caption=(
-                "**QR kod orqali login:**\n\n"
-                "1. Telegramni oching (boshqa qurilmada)\n"
-                "2. Settings → Devices → Scan QR Code\n"
-                "3. Ushbu QR kodni skanlang\n\n"
-                "_QR kod 30 soniyada yangilanadi_"
-            )
-        )
-
-        try:
-            await asyncio.wait_for(qr_login_obj.wait(), timeout=30)
-        except asyncio.TimeoutError:
-            await qr_login_obj.recreate()
-            qr_img2 = qrcode.make(qr_login_obj.url)
-            buf2 = io.BytesIO()
-            qr_img2.save(buf2, format="PNG")
-            buf2.seek(0)
-            await qr_msg.delete()
+        async def refresh_qr_code(login_token: raw.types.auth.LoginToken):
+            nonlocal qr_msg
+            buf = _build_qr_bytes(_qr_login_url(login_token.token))
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            if qr_msg:
+                try:
+                    await qr_msg.delete()
+                except Exception:
+                    pass
             qr_msg = await bot.send_photo(
                 chat_id=user_id,
-                photo=buf2,
-                caption="**Yangilangan QR kod** (30 soniya):\n\nTelegramda Scan QR Code bosing."
+                photo=buf,
+                caption=(
+                    "**QR kod orqali login:**\n\n"
+                    "1. Telegramni oching (boshqa qurilmada)\n"
+                    "2. Settings → Devices → Scan QR Code\n"
+                    "3. Ushbu QR kodni skanlang\n\n"
+                    "_QR kod avtomatik yangilanadi_"
+                )
             )
-            await asyncio.wait_for(qr_login_obj.wait(), timeout=30)
+
+        if isinstance(login_token, raw.types.auth.LoginTokenSuccess):
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        else:
+            await refresh_qr_code(login_token)
+            await _wait_for_qr_login(client, login_token, refresh_qr_code)
 
         # Export session BEFORE disconnect (inside try block)
         string_session = await client.export_session_string()
@@ -293,7 +470,7 @@ async def qr_login(bot: Client, message: Message):
             await bot.send_message(user_id, "**Noto'g'ri parol.**")
         except Exception:
             await bot.send_message(user_id, "**2FA jarayonida xato yuz berdi.**")
-    except asyncio.TimeoutError:
+    except TimeoutError:
         await bot.send_message(user_id, "**QR kod muddati tugadi. /qrlogin ni qayta yuboring.**")
     except Exception as e:
         await bot.send_message(user_id, f"**Xato:** `{e}`")
@@ -308,10 +485,10 @@ async def qr_login(bot: Client, message: Message):
         except Exception:
             pass
         try:
-            for f in glob.glob(f"{session_path}*"):
-                os.remove(f)
+            await _cleanup_session_files(session_path)
         except Exception:
             pass
+        await _clear_qr_active(user_id)
 
 
 # Don't Remove Credit Tg - @VJ_Botz
