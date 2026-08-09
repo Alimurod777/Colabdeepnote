@@ -2411,7 +2411,6 @@ async def _queue_upload_job(upload_job: dict) -> None:
     try:
         await queue_upload(
             upload_via_user_session,
-            upload_payload["user_id"],
             on_complete=_finalize_upload,
             on_error=_finalize_upload,
             **upload_payload
