@@ -112,7 +112,7 @@ async def _upload_worker(worker_id: int, max_retries: int = 3) -> None:
 
             for attempt in range(max_retries):
                 try:
-                    result = await upload_func(*args, **kwargs)
+                    result = await upload_func(*args, user_id=user_id, **kwargs)
                     success = result is None or bool(result)
                     last_error = None
                     break
